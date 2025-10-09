@@ -191,6 +191,11 @@ type BackupSpec struct {
 	// BackupType specifies how volume data is backed up, with possible values including Full and Incremental.
 	// +optional
 	BackupType BackupType `json:"backupType,omitempty"`
+
+	// Cancel specifies whether to cancel the backup.
+	// +optional
+	// +nullable
+	Cancel *bool `json:"cancel,omitempty"`
 }
 
 // UploaderConfigForBackup defines the configuration for the uploader when doing backup.
@@ -295,7 +300,7 @@ const (
 
 // BackupPhase is a string representation of the lifecycle phase
 // of a Velero backup.
-// +kubebuilder:validation:Enum=New;Queued;ReadyToStart;FailedValidation;InProgress;WaitingForPluginOperations;WaitingForPluginOperationsPartiallyFailed;Finalizing;FinalizingPartiallyFailed;Completed;PartiallyFailed;Failed;Deleting
+// +kubebuilder:validation:Enum=New;Queued;ReadyToStart;FailedValidation;InProgress;WaitingForPluginOperations;WaitingForPluginOperationsPartiallyFailed;Finalizing;FinalizingPartiallyFailed;Completed;PartiallyFailed;Failed;Deleting;Cancelling;Cancelled
 type BackupPhase string
 
 const (
@@ -362,6 +367,12 @@ const (
 
 	// BackupPhaseDeleting means the backup and all its associated data are being deleted.
 	BackupPhaseDeleting BackupPhase = "Deleting"
+
+	// BackupPhaseCancelling means the backup is in the process of being cancelled.
+	BackupPhaseCancelling BackupPhase = "Cancelling"
+
+	// BackupPhaseCancelled means the backup was successfully cancelled.
+	BackupPhaseCancelled BackupPhase = "Cancelled"
 )
 
 // BackupType specifies how volume data is backed up, with possible values including Full and Incremental.

@@ -18,6 +18,7 @@ package backup
 
 import (
 	"sync"
+	"time"
 
 	"github.com/gobwas/glob"
 	"k8s.io/apimachinery/pkg/labels"
@@ -93,6 +94,8 @@ type Request struct {
 	SkippedVolumeTracker          *skipVolumeTracker
 	VolumesInformation            volume.BackupVolumesInformation
 	WorkerPool                    *ItemBlockWorkerPool
+	Cancel                        bool
+	LastCancelCheck               time.Time
 
 	// ClusterScopedFilterMap holds resolved global filters for cluster-scoped resources.
 	// Key is the resolved group-resource string.
