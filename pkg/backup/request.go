@@ -17,6 +17,7 @@ limitations under the License.
 package backup
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -96,6 +97,8 @@ type Request struct {
 	WorkerPool                    *ItemBlockWorkerPool
 	Cancel                        bool
 	LastCancelCheck               time.Time
+	BackupContext                 context.Context
+	BackupCancelFunc              context.CancelFunc
 
 	// ClusterScopedFilterMap holds resolved global filters for cluster-scoped resources.
 	// Key is the resolved group-resource string.

@@ -406,12 +406,15 @@ func (b *backupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 }
 
 func (b *backupReconciler) prepareBackupRequest(ctx context.Context, backup *velerov1api.Backup, logger logrus.FieldLogger) *pkgbackup.Request {
+	backupCtx, backupCancelFunc := context.WithCancel(ctx)
 	request := &pkgbackup.Request{
 		Backup:                        backup.DeepCopy(), // don't modify items in the cache
 		SkippedVolumeTracker:          pkgbackup.NewSkipVolumeTracker(),
 		BackedUpItems:                 pkgbackup.NewBackedUpItemsMap(),
 		MustIncludeAdditionalItemPVCs: pkgbackup.NewBackedUpItemsMap(),
 		WorkerPool:                    pkgbackup.StartItemBlockWorkerPool(ctx, b.itemBlockWorkerCount, logger),
+		BackupContext:                 backupCtx,
+		BackupCancelFunc:              backupCancelFunc,
 	}
 	request.VolumesInformation.Init()
 
@@ -762,6 +765,9 @@ func (b *backupReconciler) validateAndGetSnapshotLocations(backup *velerov1api.B
 // field is checked to see if the backup was a partial failure.
 
 func (b *backupReconciler) runBackup(backup *pkgbackup.Request) error {
+	// Ensure backup context is cancelled when we exit to prevent context leaks
+	defer backup.BackupCancelFunc()
+
 	b.logger.WithField(constant.ControllerBackup, kubeutil.NamespaceAndName(backup)).Info("Setting up backup log")
 
 	// Log the backup to both a backup log file and to stdout. This will help see what happened if the upload of the
