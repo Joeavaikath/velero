@@ -12,7 +12,7 @@ This RFC combines the Backup and Restore cancellation proposals in [#9284](https
 
 ### Requesting cancellation
 
-**Proposal:** add an optional, one-way `spec.cancel` field to both resources:
+**Decided:** use an optional, one-way `spec.cancel` field on both resources:
 
 ```yaml
 spec:
@@ -30,11 +30,9 @@ Both commands accept `--wait` to report the final phase. A successful API write 
 
 A field keeps the API simple, but requires permission to update or patch the Backup or Restore. Kubernetes RBAC cannot limit that permission to `spec.cancel` alone.
 
-**Open question:** do we need cancellation-only permissions or a record of each request? A separate request resource would provide these at the cost of another object to manage.
-
 ### Status and completion
 
-**Proposal:** add two phases:
+**Decided:** use `Cancelling` and `Cancelled` for the two new phases:
 
 ```text
 cancellable phase -- request accepted --> Cancelling
@@ -47,7 +45,7 @@ Cancelling -- work finishes or deadline expires --> Cancelled
 
 `Cancelled` means Velero has stopped waiting after attempting cancellation through the available interfaces. It does **not** guarantee that all external work stopped or roll back changes already made. Waiting ends no later than the recorded deadline, with a concise report of any known unconfirmed work. This avoids both waiting forever and abandoning useful cancellation attempts immediately.
 
-**Open questions:** agree phase spelling, the time limit and its configuration, and how status and CLI output show late requests or unconfirmed work. See the [decision summary](#decision-summary).
+**Open questions:** agree the time limit and its configuration, and how status and CLI output show late requests or unconfirmed work. See the [decision summary](#decision-summary).
 
 ### Data and diagnostics
 
@@ -60,13 +58,13 @@ Early cancellation may leave no archive or diagnostics. Downloads and CLI output
 
 ### Controller responsibility
 
-**Proposal:** a dedicated cancellation controller owns the deadline, coordinates cancellation, resumes it after a restart, and records the final outcome. Every controller handling a cancellable phase stops normal processing once cancellation is accepted; child controllers keep their own cancellation protocols.
+**Decided:** cancellation requires controller ownership of the deadline, cancellation coordination, restart recovery, and final outcome. Every controller handling a cancellable phase stops normal processing once cancellation is accepted; child controllers keep their own cancellation protocols.
 
 Deadline handling must stay responsive even when workflow, plugin, or provider calls are blocked. The controller must act only on children belonging to the correct Backup or Restore, identified by namespace and UID.
 
 Status and metrics must avoid secrets and unbounded identifiers; reporting must not grow without limit.
 
-**Open question:** should a dedicated controller own this responsibility, or can existing Backup and Restore controllers provide the same clear ownership and independent deadline handling?
+**Open implementation question:** should a dedicated controller own this responsibility, or should it live in the existing Backup and Restore controllers?
 
 ### Stopping work
 
@@ -94,7 +92,7 @@ Each workflow design must identify its cancellation checks, child discovery, sup
 
 ## Rollout and validation
 
-1. Agree the API, phases, deadline, controller ownership, and workflow policies.
+1. Resolve the remaining validation, status, deadline, controller structure, and workflow-policy questions.
 2. Update CRDs, generated clients, permissions, controllers, and CLI together. Review every phase-dependent path, including recovery, synchronization, finalization, deletion/expiration, restore-source validation, downloads, and metrics. Older servers may ignore cancellation; older CRDs may reject the new phases.
 3. Test cancellation before work starts, child/plugin limitations, completion races, restarts, hooks, data preservation, deletion races, and late results. Confirm cancelled Backups cannot be restored and blocked calls cannot prevent deadline handling.
 
@@ -114,10 +112,10 @@ Proposals remain open until recorded as decided with a brief rationale.
 
 | Topic | Decision needed |
 |---|---|
-| API and permissions | Use `spec.cancel` or a separate request resource? Are cancellation-only permissions and request history needed? How is the one-way field enforced? |
-| Controller ownership | Dedicated cancellation controller or existing workflow controllers? How are blocked calls kept from delaying the deadline? |
+| API validation | How is the one-way `spec.cancel` field enforced? |
+| Controller structure | Dedicated cancellation controller or existing workflow controllers? How are blocked calls kept from delaying the deadline? |
 | Deadline | What is the default time limit, and is configuration global, per server, or per operation? |
-| Status and UX | Which phase spelling, status fields, and public warnings/conditions? How do CLI commands and metrics show late requests and unconfirmed work? |
+| Status and UX | Which status fields and public warnings/conditions? How do CLI commands and metrics show late requests and unconfirmed work? |
 | Diagnostics | What remains available after early cancellation, and how do downloads distinguish absent files from failed uploads? |
 | Deletion | Cancel before deleting? How should direct Kubernetes deletion, late uploads, and dependent Restores interact, and how long may deletion wait or retry? |
 | Hooks | When and how should Backup run a paired post-hook after cancellation? |
@@ -125,4 +123,8 @@ Proposals remain open until recorded as decided with a brief rationale.
 
 ### Closed / decided
 
-None recorded yet.
+| Topic | Decision and rationale |
+|---|---|
+| Request API | Use `spec.cancel` on Backup and Restore, keeping the request on the existing object without a separate request resource. |
+| Controller requirement | Cancellation needs controller ownership for clear responsibility, deadline handling, and restart recovery. |
+| Phase spelling | Use `Cancelling` and `Cancelled` consistently for both Backup and Restore. |
