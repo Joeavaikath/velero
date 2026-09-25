@@ -40,6 +40,7 @@ import (
 )
 
 func TestBackupQueueReconciler(t *testing.T) {
+	cancel := true
 	scheme := runtime.NewScheme()
 	velerov1api.AddToScheme(scheme)
 
@@ -60,6 +61,15 @@ func TestBackupQueueReconciler(t *testing.T) {
 			expectQueuePosition: 1,
 		},
 		{
+			name: "Cancelled New Backup does not get queued",
+			backup: func() *velerov1api.Backup {
+				backup := builder.ForBackup(velerov1api.DefaultNamespace, "backup-11").Result()
+				backup.Spec.Cancel = &cancel
+				return backup
+			}(),
+			expectPhase: velerov1api.BackupPhaseCancelling,
+		},
+		{
 			name:        "InProgress Backup is ignored",
 			backup:      builder.ForBackup(velerov1api.DefaultNamespace, "backup-11").Phase(velerov1api.BackupPhaseInProgress).Result(),
 			expectPhase: velerov1api.BackupPhaseInProgress,
@@ -77,6 +87,15 @@ func TestBackupQueueReconciler(t *testing.T) {
 			name:        "Queued Backup moves to ReadyToStart if no others are running",
 			backup:      builder.ForBackup(velerov1api.DefaultNamespace, "backup-11").Phase(velerov1api.BackupPhaseQueued).Result(),
 			expectPhase: velerov1api.BackupPhaseReadyToStart,
+		},
+		{
+			name: "Cancelled Queued Backup does not reserve a slot",
+			backup: func() *velerov1api.Backup {
+				backup := builder.ForBackup(velerov1api.DefaultNamespace, "backup-11").Phase(velerov1api.BackupPhaseQueued).QueuePosition(1).Result()
+				backup.Spec.Cancel = &cancel
+				return backup
+			}(),
+			expectPhase: velerov1api.BackupPhaseCancelling,
 		},
 		{
 			name: "Queued Backup remains queued if no spaces available",

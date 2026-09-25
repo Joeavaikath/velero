@@ -60,6 +60,8 @@ var backupPhaseExpectations = map[velerov1api.BackupPhase]bool{
 	velerov1api.BackupPhasePartiallyFailed:                           false,
 	velerov1api.BackupPhaseFailed:                                    false,
 	velerov1api.BackupPhaseDeleting:                                  false,
+	velerov1api.BackupPhaseCancelling:                                false,
+	velerov1api.BackupPhaseCancelled:                                 false,
 }
 
 var restorePhaseExpectations = map[velerov1api.RestorePhase]bool{

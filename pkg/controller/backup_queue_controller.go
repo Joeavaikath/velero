@@ -103,8 +103,12 @@ func (r *backupQueueReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&velerov1api.Backup{}, builder.WithPredicates(predicate.Funcs{
 			UpdateFunc: func(ue event.UpdateEvent) bool {
+				oldBackup := ue.ObjectOld.(*velerov1api.Backup)
 				backup := ue.ObjectNew.(*velerov1api.Backup)
-				return backup.Status.Phase == "" || backup.Status.Phase == velerov1api.BackupPhaseNew
+				return backup.Status.Phase == "" ||
+					backup.Status.Phase == velerov1api.BackupPhaseNew ||
+					(oldBackup.Spec.Cancel == nil || !*oldBackup.Spec.Cancel) &&
+						backup.Spec.Cancel != nil && *backup.Spec.Cancel
 			},
 			CreateFunc: func(ce event.CreateEvent) bool {
 				backup := ce.Object.(*velerov1api.Backup)
@@ -245,6 +249,16 @@ func (r *backupQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		log.WithError(err).Error("unable to get backup")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	if backup.Spec.Cancel != nil && *backup.Spec.Cancel {
+		original := backup.DeepCopy()
+		backup.Status.Phase = velerov1api.BackupPhaseCancelling
+		backup.Status.QueuePosition = 0
+		if err := kube.PatchResource(original, backup, r.Client); err != nil {
+			return ctrl.Result{}, errors.Wrapf(err, "error updating Backup status to %s", backup.Status.Phase)
+		}
+		return ctrl.Result{}, nil
+	}
+
 	switch backup.Status.Phase {
 	case "", velerov1api.BackupPhaseNew:
 		// queue new backup
