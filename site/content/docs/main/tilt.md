@@ -80,6 +80,13 @@ only to override.
 for more details. Note: when not making changes to a plugin, it is not necessary to load them into
 Tilt: an existing image and version might be specified in the Velero deployment instead, and Tilt will load that.
 
+**container_engine** (String, default=detected): The container engine used to build the Velero and provider images,
+`docker` or `podman`. It is detected from the CLIs on `PATH`, preferring `docker` with the `buildx` plugin. Set it to
+`podman` to use the Podman CLI explicitly. Both build through `custom_build` rather than `docker_build`, because
+Tilt's native build calls the daemon's BuildKit gRPC API, which Podman's Docker-compatible socket does not implement
+(`unable to upgrade to h2c, received 404`). With `podman`, Tilt must also be pointed at the Podman socket through
+`DOCKER_HOST`, otherwise it looks the built image up in a different daemon and reports `No such image`.
+
 **allowed_contexts** (Array, default=[]): A list of kubeconfig contexts Tilt is allowed to use. See the Tilt documentation on
 *[allow_k8s_contexts](https://docs.tilt.dev/api.html#api.allow_k8s_contexts) for more details. Note: Kind is automatically allowed.
 

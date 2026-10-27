@@ -70,6 +70,71 @@ def detect_cluster_goarch():
 cluster_goarch = settings.get("cluster_goarch") or detect_cluster_goarch() or local_goarch
 
 
+def detect_container_engine():
+    """
+    Pick the CLI used for image builds.
+
+    "docker buildx build --load" is preferred: it works against Docker and
+    also against Podman's Docker-compatible socket (buildx runs BuildKit in a
+    builder container and --load imports the result back through the API), and
+    --load defeats the docker-container driver quirk where images otherwise
+    never reach the local store. Fall back to the podman CLI when docker (or
+    its buildx plugin) is unavailable.
+    """
+    if str(local("docker buildx version >/dev/null 2>&1 && echo yes || true", quiet = True, echo_off = True)).strip() == "yes":
+        return "docker"
+    if str(local("podman --version >/dev/null 2>&1 && echo yes || true", quiet = True, echo_off = True)).strip() == "yes":
+        return "podman"
+    return "docker"
+
+
+def check_daemon_match(container_engine):
+    """
+    Fail at load time if the image build and Tilt would use different daemons.
+
+    Tilt looks the built image up through its own client (DOCKER_HOST, else the
+    default socket), not through the docker CLI's context. If the engine that
+    built the image stored it somewhere else, the failure shows up much later
+    as "No such image". Probes that cannot answer (no docker CLI, unreachable
+    socket) skip the check rather than block.
+    """
+    tilt_host = os.getenv("DOCKER_HOST", "") or "unix:///var/run/docker.sock"
+
+    if container_engine == "docker":
+        cli_host = str(local("docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true", quiet = True, echo_off = True)).strip()
+        if cli_host and cli_host != tilt_host:
+            fail("The docker CLI builds against {} but Tilt reads images from {}. Run: export DOCKER_HOST={}".format(cli_host, tilt_host, cli_host))
+    elif container_engine == "podman":
+        server = str(local("docker --host {} version --format '{{{{range .Server.Components}}}}{{{{.Name}}}};{{{{end}}}}' 2>/dev/null || true".format(tilt_host), quiet = True, echo_off = True)).strip()
+        if server and "Podman" not in server:
+            fail("container_engine is podman, but Tilt reads images from {}, which is not Podman, so it will never see the image. Use container_engine \"docker\", or point DOCKER_HOST at the Podman socket.".format(tilt_host))
+
+
+container_engine = settings.get("container_engine") or detect_container_engine()
+check_daemon_match(container_engine)
+
+# Native docker_build drives the daemon's BuildKit gRPC API, which Podman's
+# Docker-compatible socket does not implement -- it answers 404 "unable to
+# upgrade to h2c". Both images below therefore build through a container engine
+# CLI via custom_build(), which never touches that endpoint.
+if container_engine == "podman":
+    # With no default_registry Tilt passes a short name ("velero/velero:...").
+    # Docker stores that as docker.io/velero/velero, but Podman stores it as
+    # localhost/velero/velero, so Tilt's lookup of the docker.io name fails
+    # ("No such image"). Qualify the tag unless it already names a registry.
+    # The case is a plain statement, not inside $(...): macOS /bin/sh
+    # mis-parses the closing ")" of a case pattern inside a substitution.
+    image_build_cmd = (
+        'REF="$EXPECTED_REF"; ' +
+        'case "${REF%%/*}" in *.*|*:*|localhost) ;; *) REF="docker.io/$REF";; esac; ' +
+        "podman build"
+    )
+    image_tag = '"$REF"'
+else:
+    image_build_cmd = "docker buildx build --load"
+    image_tag = "$EXPECTED_REF"
+
+
 def get_build_registry():
     """
     Value for hack/build.sh's REGISTRY, which refuses an empty one. It is only
@@ -83,7 +148,7 @@ def get_build_registry():
 # Docker's static CLI download archives use their own arch names.
 docker_cli_arch = {"amd64": "x86_64", "arm64": "aarch64"}.get(cluster_goarch, cluster_goarch)
 
-print("Tilt: cluster_goarch={} (local {})".format(cluster_goarch, local_goarch))
+print("Tilt: cluster_goarch={} (local {}), container_engine={}".format(cluster_goarch, local_goarch, container_engine))
 
 tilt_helper_dockerfile_header = """
 # Tilt image
@@ -199,12 +264,24 @@ def get_velero_entrypoint():
 
 # Set up an image build for Velero. The live update configuration syncs the output from the local_resource
 # build into the container.
-docker_build(
+#
+# The Dockerfile is written to _tiltbuild and handed to the engine CLI by path,
+# because custom_build() shells out rather than driving the BuildKit API.
+local("mkdir -p _tiltbuild", quiet = True, echo_off = True)
+velero_dockerfile_path = "_tiltbuild/Tiltfile.Dockerfile"
+local("cat > " + velero_dockerfile_path + " << 'TILTEOF'\n" + dockerfile_contents + "\nTILTEOF", quiet = True, echo_off = True)
+
+custom_build(
     ref = "velero/velero",
-    context = "_tiltbuild",
-    dockerfile_contents = dockerfile_contents,
-    target = "tilt",
-    platform = "linux/" + cluster_goarch,
+    command = (
+        image_build_cmd +
+        " --platform linux/" + cluster_goarch +
+        " -f " + velero_dockerfile_path +
+        " --target tilt" +
+        " -t " + image_tag +
+        " _tiltbuild"
+    ),
+    deps = ["./_tiltbuild/velero"],
     entrypoint = get_velero_entrypoint(),
     live_update = [
         sync("./_tiltbuild/velero", "/velero"),
@@ -294,11 +371,32 @@ def enable_provider(provider):
 
     # Set up an image build for the plugin. The live update configuration syncs the output from the local_resource
     # build into the init container, and that restarts the Velero container.
-    docker_build(
+    #
+    # custom_build like the Velero image, so this path works with Podman too. A
+    # provider checkout has no Tiltfile of its own, so the Dockerfile is written
+    # into its _tiltbuild directory here. That directory is created first: on a
+    # clean checkout it does not exist yet, and the local_resource that builds
+    # the binary is what would otherwise create it (later, and only when it
+    # runs).
+    provider_context = os.path.join(context, "_tiltbuild")
+    provider_dockerfile_path = os.path.join(provider_context, "Tiltfile.provider.Dockerfile")
+    local("mkdir -p " + provider_context, quiet = True, echo_off = True)
+    local(
+        "cat > " + provider_dockerfile_path + " << 'TILTEOF'\n" + dockerfile_contents + "\nTILTEOF",
+        quiet = True,
+        echo_off = True,
+    )
+    custom_build(
         ref = provider.get("image"),
-        context = os.path.join(context, "/_tiltbuild/"),
-        dockerfile_contents = dockerfile_contents,
-        target = "tilt",
+        command = (
+            image_build_cmd +
+            " --platform linux/" + cluster_goarch +
+            " -f " + provider_dockerfile_path +
+            " --target tilt" +
+            " -t " + image_tag +
+            " " + provider_context
+        ),
+        deps = [os.path.join(provider_context, plugin_name)],
         entrypoint = ["/bin/bash", "-c", "cp /" + plugin_name + " /target/."],
         live_update = [
             sync(os.path.join(context, "/_tiltbuild/", plugin_name), os.path.join("/", plugin_name))
