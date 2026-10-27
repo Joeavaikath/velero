@@ -1,20 +1,9 @@
 # -*- mode: Python -*-
 
-k8s_yaml([
-    'config/crd/v1/bases/velero.io_backups.yaml',
-    'config/crd/v1/bases/velero.io_backupstoragelocations.yaml',
-    'config/crd/v1/bases/velero.io_deletebackuprequests.yaml',
-    'config/crd/v1/bases/velero.io_downloadrequests.yaml',
-    'config/crd/v1/bases/velero.io_podvolumebackups.yaml',
-    'config/crd/v1/bases/velero.io_podvolumerestores.yaml',
-    'config/crd/v1/bases/velero.io_backuprepositories.yaml',
-    'config/crd/v1/bases/velero.io_restores.yaml',
-    'config/crd/v1/bases/velero.io_schedules.yaml',
-    'config/crd/v1/bases/velero.io_serverstatusrequests.yaml',
-    'config/crd/v1/bases/velero.io_volumesnapshotlocations.yaml',
-    'config/crd/v2alpha1/bases/velero.io_datauploads.yaml',
-    'config/crd/v2alpha1/bases/velero.io_datadownloads.yaml',    
-])
+# The CRDs are globbed rather than listed, so that a dev branch adding one is
+# picked up without editing this file. Globbing needs a local() call, which Tilt
+# refuses while the current kube context might be a production one, so the
+# k8s_yaml() for it lives below allow_k8s_contexts().
 
 # default values
 settings = {
@@ -48,6 +37,10 @@ if settings.get("setup-minio"):
 
 # By default, Tilt automatically allows Minikube, Docker for Desktop, Microk8s, Red Hat CodeReady Containers, Kind, K3D, and Krucible.
 allow_k8s_contexts(settings.get("allowed_contexts"))
+
+# Every CRD under config/crd, so a branch that adds one needs no edit here.
+# Deliberately after allow_k8s_contexts(): see the note at the top of the file.
+k8s_yaml(str(local('ls config/crd/*/bases/*.yaml', quiet = True, echo_off = True)).splitlines())
 
 # An empty registry means "local cluster, don't push" (kind loads the image
 # directly), and Tilt rejects default_registry("") as a missing host.
