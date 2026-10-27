@@ -104,6 +104,10 @@ RUN wget --output-document /restart.sh --quiet https://raw.githubusercontent.com
 
 # Pinned so the debugger in the image does not change under you between
 # builds; @latest made every rebuild a different dlv.
+#
+# Delve refuses a binary built by a newer Go than it understands ("Version of
+# Delve is too old for Go version go1.x.y"), so this pin has to move together
+# with the golang image below.
 DLV_VERSION = "v1.27.2"
 
 additional_docker_helper_commands = """
@@ -113,7 +117,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=%s go install github.com/go-delve/delve/cmd/
     if [ -x "$(go env GOPATH)/bin/dlv" ]; then cp "$(go env GOPATH)/bin/dlv" /usr/local/bin/dlv; \\
     else cp "$(go env GOPATH)/bin/linux_%s/dlv" /usr/local/bin/dlv; fi
 
-RUN wget -qO- https://dl.k8s.io/v1.25.2/kubernetes-client-linux-%s.tar.gz | tar xvz
+RUN wget -qO- https://dl.k8s.io/v1.25.2/kubernetes-client-linux-%s.tar.gz | tar xvz -C /tmp
 RUN wget -qO- https://download.docker.com/linux/static/stable/%s/docker-27.5.1.tgz | tar xvz -C /tmp && \\
     install -D /tmp/docker/docker /usr/local/bin/docker
 """ % (cluster_goarch, DLV_VERSION, cluster_goarch, cluster_goarch, docker_cli_arch)
