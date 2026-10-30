@@ -81,6 +81,50 @@ func TestObserveDefaultsToBackedUp(t *testing.T) {
 	assert.Equal(t, "pods", result.Items[0].GroupResource)
 }
 
+// An edge is recorded before the child is fetched or backed up, so the row it
+// mints must not claim a success nothing has established. If the child is never
+// resolved — the additional item is not found, or the child is filtered out —
+// Named is the only record that anything named it at all.
+func TestEdgeAloneMintsNamed(t *testing.T) {
+	r := NewRecorder()
+	owner := pod("ns1", "pod1")
+	r.SetParent(pvc("ns1", "data-disk"), owner)
+
+	// The edge names the child; it does not invent a row for the parent, so the
+	// parent stays a dangling reference until something processes it.
+	result := r.Result()
+	require.Len(t, result.Items, 1)
+	child := result.Items[0]
+	assert.Equal(t, OutcomeNamed, child.Outcome)
+	require.NotNil(t, child.Parent)
+	assert.Equal(t, *newItemRef(owner), *child.Parent)
+	assert.Equal(t, ParentSourceAdditionalItem, *child.ParentSource)
+}
+
+func TestObservePromotesNamedToBackedUp(t *testing.T) {
+	r := NewRecorder()
+	child := pvc("ns1", "data-disk")
+	r.SetParent(child, pod("ns1", "pod1"))
+	r.Observe(child)
+
+	items := r.Result().Items
+	require.Len(t, items, 1)
+	assert.Equal(t, OutcomeBackedUp, items[0].Outcome,
+		"processing the item resolves the edge-only row into a real verdict")
+}
+
+// A verdict recorded before the edge arrives must not be lowered to Named.
+func TestVerdictSurvivesEdgeArrivingLater(t *testing.T) {
+	r := NewRecorder()
+	child := pvc("ns1", "data-disk")
+	r.Fail(child, "snapshot denied")
+	r.SetParent(child, pod("ns1", "pod1"))
+
+	items := r.Result().Items
+	require.Len(t, items, 1)
+	assert.Equal(t, OutcomeFailed, items[0].Outcome)
+}
+
 func TestWarnUpgradesFromBackedUp(t *testing.T) {
 	r := NewRecorder()
 	id := pod("ns1", "pod1")
@@ -155,19 +199,65 @@ func TestRepeatedObserveCollapsesToOneRow(t *testing.T) {
 	assert.Equal(t, OutcomeWarning, result.Items[0].Outcome)
 }
 
-func TestSetParentFirstWins(t *testing.T) {
+func TestSetParentLetsAdditionalItemOutrankOwnerReference(t *testing.T) {
 	r := NewRecorder()
 	child := pvc("ns1", "pvc1")
-	parent1 := velero.ResourceIdentifier{GroupResource: schema.GroupResource{Resource: "virtualmachines", Group: "kubevirt.io"}, Namespace: "ns1", Name: "vm1"}
-	parent2 := velero.ResourceIdentifier{GroupResource: schema.GroupResource{Resource: "virtualmachines", Group: "kubevirt.io"}, Namespace: "ns1", Name: "vm2"}
+	fromOwnerRef := velero.ResourceIdentifier{GroupResource: schema.GroupResource{Resource: "virtualmachines", Group: "kubevirt.io"}, Namespace: "ns1", Name: "vm1"}
+	fromAction := velero.ResourceIdentifier{GroupResource: schema.GroupResource{Resource: "virtualmachines", Group: "kubevirt.io"}, Namespace: "ns1", Name: "vm2"}
 
-	r.SetParent(child, parent1)
-	r.SetParent(child, parent2)
+	r.SetOwnerParent(child, fromOwnerRef)
+	r.SetParent(child, fromAction)
 
 	result := r.Result()
 	require.Len(t, result.Items, 1)
 	require.NotNil(t, result.Items[0].Parent)
-	assert.Equal(t, *newItemRef(parent1), *result.Items[0].Parent)
+	assert.Equal(t, *newItemRef(fromAction), *result.Items[0].Parent)
+	assert.Equal(t, ParentSourceAdditionalItem, *result.Items[0].ParentSource)
+}
+
+func TestOwnerReferenceCannotDisplaceParentFromAction(t *testing.T) {
+	r := NewRecorder()
+	child := pvc("ns1", "pvc1")
+	fromOwnerRef := velero.ResourceIdentifier{GroupResource: schema.GroupResource{Resource: "virtualmachines", Group: "kubevirt.io"}, Namespace: "ns1", Name: "vm1"}
+	fromAction := velero.ResourceIdentifier{GroupResource: schema.GroupResource{Resource: "virtualmachines", Group: "kubevirt.io"}, Namespace: "ns1", Name: "vm2"}
+
+	r.SetParent(child, fromAction)
+	r.SetOwnerParent(child, fromOwnerRef)
+
+	result := r.Result()
+	require.Len(t, result.Items, 1)
+	require.NotNil(t, result.Items[0].Parent)
+	assert.Equal(t, *newItemRef(fromAction), *result.Items[0].Parent)
+	assert.Equal(t, ParentSourceAdditionalItem, *result.Items[0].ParentSource)
+}
+
+// Two item blocks back up a child and its owner concurrently, so duplicate
+// claims can arrive in either order. Duplicates of equal strength must collapse
+// to one edge rather than depending on which item block finished first.
+func TestDuplicateOwnerParentsCollapseToOne(t *testing.T) {
+	child := pvc("ns1", "pvc1")
+	first := velero.ResourceIdentifier{GroupResource: schema.GroupResource{Resource: "datavolumes", Group: "cdi.kubevirt.io"}, Namespace: "ns1", Name: "dv1"}
+	second := velero.ResourceIdentifier{GroupResource: schema.GroupResource{Resource: "datavolumes", Group: "cdi.kubevirt.io"}, Namespace: "ns1", Name: "dv2"}
+
+	r := NewRecorder()
+	r.SetOwnerParent(child, first)
+	r.SetOwnerParent(child, second)
+
+	result := r.Result()
+	require.Len(t, result.Items, 1)
+	require.NotNil(t, result.Items[0].Parent)
+	assert.Equal(t, *newItemRef(first), *result.Items[0].Parent,
+		"an equal-strength claim never displaces the edge already recorded")
+}
+
+func TestParentSourceIsUnsetWithoutParent(t *testing.T) {
+	r := NewRecorder()
+	r.Observe(pod("ns1", "pod1"))
+
+	result := r.Result()
+	require.Len(t, result.Items, 1)
+	assert.Nil(t, result.Items[0].Parent)
+	assert.Nil(t, result.Items[0].ParentSource)
 }
 
 func TestParentIsIndependentOfOutcome(t *testing.T) {

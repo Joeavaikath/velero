@@ -41,11 +41,18 @@ const (
 	OutcomeFailed Outcome = "Failed"
 	// OutcomeSkipped means the item was excluded or skipped (e.g. a skipped PVC).
 	OutcomeSkipped Outcome = "Skipped"
+	// OutcomeNamed means another item's backup named this one as its child, but
+	// nothing ever processed it: it was not observed, warned, failed or skipped.
+	// It is the only outcome that is not a verdict, and it exists so that a row
+	// created by an ownership edge cannot claim a success nobody established.
+	OutcomeNamed Outcome = "Named"
 )
 
 // precedence ranks outcomes from least to most significant, so that repeated
-// writes for one item collapse deterministically: Failed > Skipped > Warning > BackedUp.
+// writes for one item collapse deterministically: Failed > Skipped > Warning > BackedUp > Named.
+// Named sits below BackedUp because any real verdict outranks the absence of one.
 var precedence = map[Outcome]int{
+	OutcomeNamed:    -1,
 	OutcomeBackedUp: 0,
 	OutcomeWarning:  1,
 	OutcomeSkipped:  2,
@@ -76,14 +83,39 @@ func capMessages(msgs []string) []string {
 	return shown
 }
 
+// ParentSource says where a child-to-parent edge came from, so a consumer can
+// tell an ownership edge that Kubernetes records on the object from an edge a
+// backup item action inferred, and can rank them accordingly.
+type ParentSource string
+
+const (
+	// ParentSourceOwnerReference is an edge taken from the child's
+	// metadata.ownerReferences. The object itself declares the relationship.
+	ParentSourceOwnerReference ParentSource = "ownerReference"
+	// ParentSourceAdditionalItem is an edge taken from a backup item action's
+	// AdditionalItems. A plugin named the child while backing up the parent, so
+	// the plugin's view of the relationship outranks the object's own metadata.
+	ParentSourceAdditionalItem ParentSource = "additionalItem"
+)
+
+// precedence ranks parent sources from weakest to strongest. When two sources
+// name different parents for one child the stronger one wins, which makes the
+// resulting tree independent of the order concurrent item blocks happen to
+// finish in.
+var parentSourcePrecedence = map[ParentSource]int{
+	ParentSourceOwnerReference: 0,
+	ParentSourceAdditionalItem: 1,
+}
+
 // ItemOutcome is the outcome of a single backed-up item.
 type ItemOutcome struct {
-	GroupResource string   `json:"groupResource"` // e.g. "deployments.apps"
-	Namespace     string   `json:"namespace,omitempty"`
-	Name          string   `json:"name"`
-	Outcome       Outcome  `json:"outcome"`
-	Messages      []string `json:"messages,omitempty"` // errors/warnings/skip reasons attributed to this item
-	Parent        *ItemRef `json:"parent,omitempty"`   // set when this item was backed up as a sub-item of another (e.g. a VM's PVC)
+	GroupResource string        `json:"groupResource"` // e.g. "deployments.apps"
+	Namespace     string        `json:"namespace,omitempty"`
+	Name          string        `json:"name"`
+	Outcome       Outcome       `json:"outcome"`
+	Messages      []string      `json:"messages,omitempty"` // errors/warnings/skip reasons attributed to this item
+	Parent        *ItemRef      `json:"parent,omitempty"`   // set when this item was backed up as a sub-item of another (e.g. a VM's PVC)
+	ParentSource  *ParentSource `json:"parentSource,omitempty"`
 }
 
 // ItemRef identifies an item using the same flattened shape as ItemOutcome,
@@ -126,9 +158,10 @@ type Recorder struct {
 }
 
 type itemOutcomeState struct {
-	outcome  Outcome
-	messages []string
-	parent   *velero.ResourceIdentifier
+	outcome      Outcome
+	messages     []string
+	parent       *velero.ResourceIdentifier
+	parentSource ParentSource
 }
 
 // NewRecorder returns an initialized, empty Recorder.
@@ -138,10 +171,24 @@ func NewRecorder() *Recorder {
 	}
 }
 
+// rowFor returns the row for id, minting it at OutcomeBackedUp if it has none.
+// Callers that are about to record a verdict use this; callers that are only
+// learning that the item exists use edgeRowFor.
 func (r *Recorder) rowFor(id velero.ResourceIdentifier) *itemOutcomeState {
+	return r.ensureRow(id, OutcomeBackedUp)
+}
+
+// edgeRowFor returns the row for id, minting it at OutcomeNamed if it has none.
+// A row created by an ownership edge records that something named the item, not
+// that anything processed it, so it must not start at OutcomeBackedUp.
+func (r *Recorder) edgeRowFor(id velero.ResourceIdentifier) *itemOutcomeState {
+	return r.ensureRow(id, OutcomeNamed)
+}
+
+func (r *Recorder) ensureRow(id velero.ResourceIdentifier, mint Outcome) *itemOutcomeState {
 	row, ok := r.rows[id]
 	if !ok {
-		row = &itemOutcomeState{outcome: OutcomeBackedUp}
+		row = &itemOutcomeState{outcome: mint}
 		r.rows[id] = row
 	}
 	return row
@@ -149,15 +196,16 @@ func (r *Recorder) rowFor(id velero.ResourceIdentifier) *itemOutcomeState {
 
 // upgrade moves a row's outcome to the given outcome if it is more
 // significant than the row's current outcome, per the precedence order
-// Failed > Skipped > Warning > BackedUp.
+// Failed > Skipped > Warning > BackedUp > Named.
 func (row *itemOutcomeState) upgrade(outcome Outcome) {
 	if precedence[outcome] > precedence[row.outcome] {
 		row.outcome = outcome
 	}
 }
 
-// Observe records that an item began processing, defaulting it to
-// OutcomeBackedUp if it has no existing row.
+// Observe records that an item began processing, promoting a row that an
+// ownership edge minted at OutcomeNamed to OutcomeBackedUp and minting one at
+// OutcomeBackedUp if there is no existing row.
 func (r *Recorder) Observe(id velero.ResourceIdentifier) {
 	if r == nil {
 		return
@@ -166,7 +214,10 @@ func (r *Recorder) Observe(id velero.ResourceIdentifier) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.rowFor(id)
+	// rowFor mints an absent row at BackedUp; the upgrade then promotes a row an
+	// ownership edge already minted at Named. It is a no-op for every other
+	// outcome, since upgrade only ever raises a severity.
+	r.rowFor(id).upgrade(OutcomeBackedUp)
 }
 
 // Warn upgrades an item's outcome to OutcomeWarning, unless it is already
@@ -214,10 +265,33 @@ func (r *Recorder) Skip(id velero.ResourceIdentifier, reason string) {
 	row.messages = append(row.messages, reason)
 }
 
-// SetParent records that child was backed up as a sub-item of parent. Parent
-// is set once and never overwritten: the first SetParent call for a given
-// child wins.
+// SetParent records that child was backed up as a sub-item of parent, as named
+// by a backup item action's AdditionalItems. A plugin recording the child while
+// backing up the parent is a stronger claim than the child's own
+// metadata.ownerReferences, so this overrides any owner-reference parent set by
+// SetOwnerParent.
 func (r *Recorder) SetParent(child, parent velero.ResourceIdentifier) {
+	r.setParent(child, parent, ParentSourceAdditionalItem)
+}
+
+// SetOwnerParent records that child names parent in its metadata.ownerReferences.
+// It is a weaker claim than SetParent and never displaces a parent a backup item
+// action has already named.
+func (r *Recorder) SetOwnerParent(child, parent velero.ResourceIdentifier) {
+	r.setParent(child, parent, ParentSourceOwnerReference)
+}
+
+// setParent installs child's parent if the claim is at least as strong as the
+// one already recorded. Comparing on source rather than arrival order keeps the
+// tree stable when two item blocks back up a child and its parent concurrently:
+// whichever finishes first, the surviving edge is the same.
+//
+// The row is minted at OutcomeNamed rather than OutcomeBackedUp. An edge is set
+// before the child is fetched or backed up, so at this point nothing has
+// confirmed the child is in the backup; when the child is processed, Observe
+// promotes the row. A row still reading Named in a finished artifact is one a
+// plugin named and nothing resolved.
+func (r *Recorder) setParent(child, parent velero.ResourceIdentifier, source ParentSource) {
 	if r == nil {
 		return
 	}
@@ -225,11 +299,14 @@ func (r *Recorder) SetParent(child, parent velero.ResourceIdentifier) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	row := r.rowFor(child)
-	if row.parent == nil {
-		p := parent
-		row.parent = &p
+	row := r.edgeRowFor(child)
+	if row.parent != nil && parentSourcePrecedence[source] <= parentSourcePrecedence[row.parentSource] {
+		return
 	}
+
+	p := parent
+	row.parent = &p
+	row.parentSource = source
 }
 
 // Result returns the recorded outcomes as a sorted, deterministic
@@ -248,14 +325,19 @@ func (r *Recorder) Result() *ItemOutcomes {
 	defer r.mu.Unlock()
 
 	for id, row := range r.rows {
-		result.Items = append(result.Items, ItemOutcome{
+		item := ItemOutcome{
 			GroupResource: id.GroupResource.String(),
 			Namespace:     id.Namespace,
 			Name:          id.Name,
 			Outcome:       row.outcome,
 			Messages:      capMessages(row.messages),
 			Parent:        newParentRef(row.parent),
-		})
+		}
+		if item.Parent != nil {
+			source := row.parentSource
+			item.ParentSource = &source
+		}
+		result.Items = append(result.Items, item)
 	}
 
 	sort.Slice(result.Items, func(i, j int) bool {

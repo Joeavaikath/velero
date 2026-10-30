@@ -227,6 +227,7 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 		Name:          name,
 	}
 	ib.backupRequest.ItemOutcomes.Observe(resourceIdentifier)
+	ib.recordOwnerParent(metadata, resourceIdentifier)
 
 	// failItem aggregates errs, records the failure against this item directly
 	// rather than relying on the log hook to notice it (a caller further up
@@ -394,6 +395,78 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 	}
 	itemFiles = append(itemFiles, fileForArchive)
 	return true, itemFiles, nil
+}
+
+// recordOwnerParent derives the item's parent from its metadata.ownerReferences.
+// It is a floor under the edges backup item actions record: those name parents
+// the object itself does not know about (a PV names its PVC through claimRef, a
+// VolumeSnapshotContent names its snapshot through spec), and SetParent outranks
+// what this writes.
+//
+// A backup item action only names the children it walks to, so owner references
+// are what connect the objects no action reaches: a CDI DataVolume's PVC names
+// the DataVolume, not the pod that mounts it.
+func (ib *itemBackupper) recordOwnerParent(metadata metav1.Object, item velero.ResourceIdentifier) {
+	if ib.backupRequest.ItemOutcomes == nil {
+		return
+	}
+
+	// The controller owner is the one relationship Kubernetes guarantees is
+	// single-valued; an object's other owner references say only that it is also
+	// associated with something, which is too weak to call a parent.
+	owner := metav1.GetControllerOf(metadata)
+	if owner == nil {
+		return
+	}
+
+	groupResource, ownerNamespaced, err := ib.ownerRefGroupResource(*owner)
+	if err != nil {
+		// Not every owner is a backuppable resource: many objects are owned by
+		// kinds Velero never lists as items. Dropping the edge is right; the
+		// alternative is failing a backup over a row in a report.
+		return
+	}
+
+	// An owner reference names no namespace of its own, so the scope has to come
+	// from discovery. It matters: a namespaced owner is in the child's namespace,
+	// but a cluster-scoped one (a Node owning a Pod) is not in any namespace, and
+	// naming the child's would match nothing in the artifact.
+	namespace := ""
+	if ownerNamespaced {
+		namespace = metadata.GetNamespace()
+	}
+
+	parent := velero.ResourceIdentifier{
+		GroupResource: groupResource,
+		Namespace:     namespace,
+		Name:          owner.Name,
+	}
+	if parent == item {
+		// A self-edge would make the item its own root and run the describer's
+		// walk up to its depth limit. Nothing honest produces one; refuse it here
+		// rather than rely on every reader to notice.
+		return
+	}
+
+	ib.backupRequest.ItemOutcomes.SetOwnerParent(item, parent)
+}
+
+// ownerRefGroupResource resolves an owner reference's kind and API version to the
+// group resource the backup identifies items by, and reports whether that
+// resource is namespaced.
+func (ib *itemBackupper) ownerRefGroupResource(owner metav1.OwnerReference) (schema.GroupResource, bool, error) {
+	gv, err := schema.ParseGroupVersion(owner.APIVersion)
+	if err != nil {
+		return schema.GroupResource{}, false, err
+	}
+	if ib.discoveryHelper == nil {
+		return schema.GroupResource{}, false, errors.New("no discovery helper")
+	}
+	gvr, apiResource, err := ib.discoveryHelper.KindFor(gv.WithKind(owner.Kind))
+	if err != nil {
+		return schema.GroupResource{}, false, err
+	}
+	return gvr.GroupResource(), apiResource.Namespaced, nil
 }
 
 func getFileForArchive(namespace, name, groupResource, versionPath string, itemBytes []byte) (FileForArchive, error) {
