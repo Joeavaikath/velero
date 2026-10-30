@@ -875,7 +875,18 @@ func (kb *kubernetesBackupper) backupItemBlock(itemBlock *BackupItemBlock) []sch
 	}
 	postHookPods, failedPods, errs := kb.handleItemBlockPreHooks(itemBlock, preHookPods)
 	for i, pod := range failedPods {
-		itemBlock.Log.WithError(errs[i]).WithField("name", pod.Item.GetName()).Error("Error running pre hooks for pod")
+		// resource and namespace are logged alongside name because the per-item
+		// log hook attributes an event only when it sees both a resource and a
+		// name, and falls back to a namespace-less Velero error otherwise. For a
+		// failed pre-hook there is no second record: the pod is flagged as
+		// backed up below and then skipped by backupItem's already-backed-up
+		// check, which returns before Observe, so this log line is the only
+		// place the failure is captured.
+		itemBlock.Log.WithError(errs[i]).WithFields(logrus.Fields{
+			"resource":  pod.Gr.String(),
+			"namespace": pod.Item.GetNamespace(),
+			"name":      pod.Item.GetName(),
+		}).Error("Error running pre hooks for pod")
 		// if pre hook fails, flag pod as backed-up and move on
 		key, err := kb.getItemKey(pod)
 		if err != nil {
@@ -943,7 +954,16 @@ func (kb *kubernetesBackupper) handleItemBlockPostHooks(itemBlock *BackupItemBlo
 	for _, pod := range hookPods {
 		if err := itemBlock.itemBackupper.itemHookHandler.HandleHooks(itemBlock.Log, pod.Gr, pod.Item, itemBlock.itemBackupper.backupRequest.ResourceHooks,
 			hook.PhasePost, itemBlock.itemBackupper.hookTracker); err != nil {
-			log.WithError(err).WithField("name", pod.Item.GetName()).Error("Error running post hooks for pod")
+			// Same fields as the pre-hook line, and for the same reason: the
+			// per-item log hook attributes an event only when it sees both a
+			// resource and a name. Without them a failed post-hook counts toward
+			// the backup's error total but is filed as a namespace-less Velero
+			// error, so nothing ties it to the pod it belongs to.
+			log.WithError(err).WithFields(logrus.Fields{
+				"resource":  pod.Gr.String(),
+				"namespace": pod.Item.GetNamespace(),
+				"name":      pod.Item.GetName(),
+			}).Error("Error running post hooks for pod")
 		}
 	}
 }

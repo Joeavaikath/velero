@@ -32,6 +32,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/vmware-tanzu/velero/internal/itemoutcome"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	pkgbackup "github.com/vmware-tanzu/velero/pkg/backup"
 	"github.com/vmware-tanzu/velero/pkg/client"
@@ -195,6 +196,7 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		SkippedVolumeTracker:          pkgbackup.NewSkipVolumeTracker(),
 		BackedUpItems:                 pkgbackup.NewBackedUpItemsMap(),
 		MustIncludeAdditionalItemPVCs: pkgbackup.NewBackedUpItemsMap(),
+		ItemOutcomes:                  itemoutcome.NewRecorder(),
 	}
 	var outBackupFile *os.File
 	if len(operations) > 0 {

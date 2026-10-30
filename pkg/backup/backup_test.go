@@ -45,6 +45,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/utils/ptr"
 
+	"github.com/vmware-tanzu/velero/internal/itemoutcome"
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	"github.com/vmware-tanzu/velero/pkg/apis/velero/shared"
@@ -1710,6 +1711,97 @@ func TestBackupActionsRunForCorrectItems(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestItemOutcomesCapture verifies that a backup records per-item outcomes,
+// including BackedUp for ordinarily-processed items and Parent for items
+// returned as additionalItemIdentifiers by a BackupItemAction.
+func TestItemOutcomesCapture(t *testing.T) {
+	itemBlockPool := StartItemBlockWorkerPool(t.Context(), 1, logrus.StandardLogger())
+	defer itemBlockPool.Stop()
+
+	h := newHarness(t, itemBlockPool)
+	req := &Request{
+		Backup:               defaultBackup().Result(),
+		SkippedVolumeTracker: NewSkipVolumeTracker(),
+		BackedUpItems:        NewBackedUpItemsMap(),
+		WorkerPool:           itemBlockPool,
+		ItemOutcomes:         itemoutcome.NewRecorder(),
+	}
+	backupFile := bytes.NewBuffer([]byte{})
+
+	h.addItems(t, test.Pods(
+		builder.ForPod("ns-1", "pod-1").Result(),
+	))
+	h.addItems(t, test.PVCs(
+		builder.ForPersistentVolumeClaim("ns-1", "pvc-1").Result(),
+	))
+
+	action := new(recordResourcesAction).ForResource("pods").WithAdditionalItems([]velero.ResourceIdentifier{
+		{
+			GroupResource: kuberesource.PersistentVolumeClaims,
+			Namespace:     "ns-1",
+			Name:          "pvc-1",
+		},
+	})
+
+	err := h.backupper.Backup(h.log, req, backupFile, []biav2.BackupItemAction{action}, nil, nil)
+	require.NoError(t, err)
+
+	result := req.ItemOutcomes.Result()
+	byKey := map[string]itemoutcome.ItemOutcome{}
+	for _, item := range result.Items {
+		byKey[item.GroupResource+"/"+item.Namespace+"/"+item.Name] = item
+	}
+
+	pod, ok := byKey["pods/ns-1/pod-1"]
+	require.True(t, ok)
+	assert.Equal(t, itemoutcome.OutcomeBackedUp, pod.Outcome)
+	assert.Nil(t, pod.Parent)
+
+	pvc, ok := byKey[kuberesource.PersistentVolumeClaims.String()+"/ns-1/pvc-1"]
+	require.True(t, ok)
+	assert.Equal(t, itemoutcome.OutcomeBackedUp, pvc.Outcome)
+	require.NotNil(t, pvc.Parent)
+	assert.Equal(t, kuberesource.Pods.String(), pvc.Parent.GroupResource)
+	assert.Equal(t, "ns-1", pvc.Parent.Namespace)
+	assert.Equal(t, "pod-1", pvc.Parent.Name)
+}
+
+// TestItemOutcomesCapturesSynchronousFailure verifies that an item whose
+// BackupItemAction.Execute returns an error is recorded as OutcomeFailed,
+// even though the only place that error is logged (kubernetesBackupper.backupItem)
+// does not attach structured resource/namespace fields the log hook could
+// otherwise have used to attribute it.
+func TestItemOutcomesCapturesSynchronousFailure(t *testing.T) {
+	itemBlockPool := StartItemBlockWorkerPool(t.Context(), 1, logrus.StandardLogger())
+	defer itemBlockPool.Stop()
+
+	h := newHarness(t, itemBlockPool)
+	req := &Request{
+		Backup:               defaultBackup().Result(),
+		SkippedVolumeTracker: NewSkipVolumeTracker(),
+		BackedUpItems:        NewBackedUpItemsMap(),
+		WorkerPool:           itemBlockPool,
+		ItemOutcomes:         itemoutcome.NewRecorder(),
+	}
+	backupFile := bytes.NewBuffer([]byte{})
+
+	h.addItems(t, test.Pods(
+		builder.ForPod("ns-1", "pod-1").Result(),
+	))
+
+	executionErr := errors.New("boom")
+	action := new(recordResourcesAction).ForResource("pods").WithExecutionErr(executionErr)
+
+	err := h.backupper.Backup(h.log, req, backupFile, []biav2.BackupItemAction{action}, nil, nil)
+	require.NoError(t, err)
+
+	result := req.ItemOutcomes.Result()
+	require.Len(t, result.Items, 1)
+	assert.Equal(t, itemoutcome.OutcomeFailed, result.Items[0].Outcome)
+	require.Len(t, result.Items[0].Messages, 1)
+	assert.Contains(t, result.Items[0].Messages[0], "boom")
 }
 
 // TestBackupWithInvalidActions runs backups with backup item actions that are invalid

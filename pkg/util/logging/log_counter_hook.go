@@ -19,10 +19,14 @@ package logging
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"github.com/vmware-tanzu/velero/internal/itemoutcome"
+	"github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	"github.com/vmware-tanzu/velero/pkg/util/results"
 )
 
@@ -30,16 +34,19 @@ import (
 // statements that have been written at each logrus level. It also
 // maintains log entries at each logrus level in result structure.
 type LogHook struct {
-	mu      sync.RWMutex
-	counts  map[logrus.Level]int
-	entries map[logrus.Level]*results.Result
+	mu       sync.RWMutex
+	counts   map[logrus.Level]int
+	entries  map[logrus.Level]*results.Result
+	recorder *itemoutcome.Recorder
 }
 
-// NewLogHook returns a pointer to an initialized LogHook.
-func NewLogHook() *LogHook {
+// NewLogHook returns a pointer to an initialized LogHook. recorder may be nil,
+// in which case per-item outcome capture is a no-op.
+func NewLogHook(recorder *itemoutcome.Recorder) *LogHook {
 	return &LogHook{
-		counts:  make(map[logrus.Level]int),
-		entries: make(map[logrus.Level]*results.Result),
+		counts:   make(map[logrus.Level]int),
+		entries:  make(map[logrus.Level]*results.Result),
+		recorder: recorder,
 	}
 }
 
@@ -88,6 +95,27 @@ func (h *LogHook) Fire(entry *logrus.Entry) error {
 	} else {
 		h.entries[entry.Level].AddVeleroError(errors.New(entryMessage))
 	}
+
+	// Capture the same event structurally, keyed by the item's canonical
+	// identity, while entry.Data still carries it as separate fields rather
+	// than the flattened entryMessage string above.
+	if isResourceFieldPresent && isNameFieldPresent && (entry.Level == logrus.ErrorLevel || entry.Level == logrus.WarnLevel) {
+		id := velero.ResourceIdentifier{
+			GroupResource: schema.ParseGroupResource(resourceField.(string)),
+			Name:          nameField.(string),
+		}
+		if isNamespacePresent {
+			id.Namespace = namespace.(string)
+		}
+
+		msg := strings.TrimSpace(entryMessage)
+		if entry.Level == logrus.ErrorLevel {
+			h.recorder.Fail(id, msg)
+		} else {
+			h.recorder.Warn(id, msg)
+		}
+	}
+
 	return nil
 }
 

@@ -221,6 +221,29 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 	ib.backupRequest.BackedUpItems.AddItem(key)
 	log.Info("Backing up item")
 
+	resourceIdentifier := velero.ResourceIdentifier{
+		GroupResource: groupResource,
+		Namespace:     namespace,
+		Name:          name,
+	}
+	ib.backupRequest.ItemOutcomes.Observe(resourceIdentifier)
+
+	// failItem aggregates errs, records the failure against this item directly
+	// rather than relying on the log hook to notice it (a caller further up
+	// the stack may log the aggregate under a different item's identity, or
+	// without the structured fields the log hook needs), and returns the
+	// aggregate for the caller to propagate. namespace/name are read live, so
+	// a rename by a plugin action before the call is reflected.
+	failItem := func(errs []error) error {
+		aggregate := kubeerrs.NewAggregate(errs)
+		ib.backupRequest.ItemOutcomes.Fail(velero.ResourceIdentifier{
+			GroupResource: groupResource,
+			Namespace:     namespace,
+			Name:          name,
+		}, aggregate.Error())
+		return aggregate
+	}
+
 	var (
 		backupErrs []error
 		pod        *corev1api.Pod
@@ -278,7 +301,7 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 	updatedObj, additionalItemFiles, err := ib.executeActions(log, obj, groupResource, name, namespace, metadata, finalize, itemBlock)
 	if err != nil {
 		backupErrs = append(backupErrs, err)
-		return false, itemFiles, kubeerrs.NewAggregate(backupErrs)
+		return false, itemFiles, failItem(backupErrs)
 	}
 
 	// If err is nil and updatedObj is nil, it means the item is skipped by plugin action,
@@ -286,13 +309,15 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 	if updatedObj == nil {
 		log.Infof("Remove item from the backup's backupItems list and totalItems list because it's skipped by plugin action.")
 		ib.backupRequest.BackedUpItems.DeleteItem(key)
+		ib.backupRequest.ItemOutcomes.Skip(resourceIdentifier, "skipped by backup item action")
 		return false, itemFiles, nil
 	}
 
 	itemFiles = append(itemFiles, additionalItemFiles...)
 	obj = updatedObj
 	if metadata, err = meta.Accessor(obj); err != nil {
-		return false, itemFiles, errors.WithStack(err)
+		backupErrs = append(backupErrs, errors.WithStack(err))
+		return false, itemFiles, failItem(backupErrs)
 	}
 	// update name and namespace in case they were modified in an action
 	name = metadata.GetName()
@@ -341,12 +366,13 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 	}
 
 	if len(backupErrs) != 0 {
-		return false, itemFiles, kubeerrs.NewAggregate(backupErrs)
+		return false, itemFiles, failItem(backupErrs)
 	}
 
 	itemBytes, err := json.Marshal(obj.UnstructuredContent())
 	if err != nil {
-		return false, itemFiles, errors.WithStack(err)
+		backupErrs = append(backupErrs, errors.WithStack(err))
+		return false, itemFiles, failItem(backupErrs)
 	}
 
 	if versionPath == preferredGVR.Version {
@@ -354,7 +380,8 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 		log.Debugf("Resource %s/%s, version= %s, preferredVersion=%s", groupResource.String(), name, versionPath, preferredGVR.Version)
 		fileForArchive, err := getFileForArchive(namespace, name, groupResource.String(), "", itemBytes)
 		if err != nil {
-			return false, itemFiles, err
+			backupErrs = append(backupErrs, errors.WithStack(err))
+			return false, itemFiles, failItem(backupErrs)
 		}
 		itemFiles = append(itemFiles, fileForArchive)
 		versionPath = versionPath + velerov1api.PreferredVersionDir
@@ -362,7 +389,8 @@ func (ib *itemBackupper) backupItemInternal(logger logrus.FieldLogger, obj runti
 
 	fileForArchive, err := getFileForArchive(namespace, name, groupResource.String(), versionPath, itemBytes)
 	if err != nil {
-		return false, itemFiles, err
+		backupErrs = append(backupErrs, errors.WithStack(err))
+		return false, itemFiles, failItem(backupErrs)
 	}
 	itemFiles = append(itemFiles, fileForArchive)
 	return true, itemFiles, nil
@@ -531,7 +559,14 @@ func (ib *itemBackupper) executeActions(
 			*itemOperList = append(*itemOperList, &newOperation)
 		}
 
+		currentItemIdentifier := velero.ResourceIdentifier{
+			GroupResource: groupResource,
+			Namespace:     namespace,
+			Name:          name,
+		}
 		for _, additionalItem := range additionalItemIdentifiers {
+			ib.backupRequest.ItemOutcomes.SetParent(additionalItem, currentItemIdentifier)
+
 			var itemList []itemblock.ItemBlockItem
 
 			// get item content from itemBlock if it's there to avoid the additional APIServer call
@@ -810,8 +845,37 @@ func (ib *itemBackupper) trackSkippedVolume(obj runtime.Unstructured, groupResou
 	pvName, pvcName, pvcNamespace, err := getVolumeTrackingInfo(obj, groupResource)
 	if err == nil && (len(pvName) > 0 || len(pvcName) > 0) {
 		ib.backupRequest.SkippedVolumeTracker.Track(pvName, pvcName, pvcNamespace, approach, reason)
+
+		// The tracker is what feeds the volumeinfo artifact, but it carries no
+		// link back to the item that owned the volume, so a reader chasing a
+		// failed VM cannot tell where the skip came from. Record the same skip
+		// against the item itself so the item-outcomes artifact explains it in
+		// place. Skipped is a weaker outcome than Failed, so this never masks a
+		// real failure recorded for the same item.
+		if metadata, mErr := meta.Accessor(obj); mErr == nil {
+			ib.backupRequest.ItemOutcomes.Skip(velero.ResourceIdentifier{
+				GroupResource: groupResource,
+				Namespace:     metadata.GetNamespace(),
+				Name:          metadata.GetName(),
+			}, fmt.Sprintf("%s volume skipped (%s): %s", approach, volumeRef(pvName, pvcName), reason))
+		}
 	} else if err != nil {
 		log.WithError(err).Info("unable to get volume tracking info, skip tracking.")
+	}
+}
+
+// volumeRef renders whichever of the PV/PVC identifiers is populated, so a
+// skip message names the volume a reader would recognise.
+func volumeRef(pvName, pvcName string) string {
+	switch {
+	case pvcName != "" && pvName != "":
+		return fmt.Sprintf("pvc=%s pv=%s", pvcName, pvName)
+	case pvcName != "":
+		return fmt.Sprintf("pvc=%s", pvcName)
+	case pvName != "":
+		return fmt.Sprintf("pv=%s", pvName)
+	default:
+		return "unknown volume"
 	}
 }
 

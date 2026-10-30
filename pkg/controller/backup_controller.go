@@ -43,6 +43,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	"github.com/vmware-tanzu/velero/internal/credentials"
+	"github.com/vmware-tanzu/velero/internal/itemoutcome"
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/storage"
 	"github.com/vmware-tanzu/velero/internal/volume"
@@ -400,6 +401,7 @@ func (b *backupReconciler) prepareBackupRequest(ctx context.Context, backup *vel
 		BackedUpItems:                 pkgbackup.NewBackedUpItemsMap(),
 		MustIncludeAdditionalItemPVCs: pkgbackup.NewBackedUpItemsMap(),
 		WorkerPool:                    pkgbackup.StartItemBlockWorkerPool(ctx, b.itemBlockWorkerCount, logger),
+		ItemOutcomes:                  itemoutcome.NewRecorder(),
 	}
 	request.VolumesInformation.Init()
 
@@ -883,7 +885,7 @@ func (b *backupReconciler) runBackup(backup *pkgbackup.Request) error {
 
 	// Log the backup to both a backup log file and to stdout. This will help see what happened if the upload of the
 	// backup log failed for whatever reason.
-	logCounter := logging.NewLogHook()
+	logCounter := logging.NewLogHook(backup.ItemOutcomes)
 	backupLog, err := logging.NewTempFileLogger(b.backupLogLevel, b.formatFlag, logCounter, logrus.Fields{constant.ControllerBackup: kubeutil.NamespaceAndName(backup)})
 	if err != nil {
 		return errors.Wrap(err, "error creating dual mode logger for backup")
