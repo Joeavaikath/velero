@@ -35,6 +35,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/vmware-tanzu/velero/internal/credentials"
+	"github.com/vmware-tanzu/velero/internal/itemoutcome"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/builder"
@@ -1155,6 +1156,134 @@ func TestGetBackupVolumeInfos(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetBackupItemOutcomes(t *testing.T) {
+	tests := []struct {
+		name           string
+		itemOutcomes   *itemoutcome.ItemOutcomes
+		expectedResult *itemoutcome.ItemOutcomes
+	}{
+		{
+			name:           "No item outcomes artifact, expect empty result and no error.",
+			expectedResult: &itemoutcome.ItemOutcomes{SchemaVersion: itemoutcome.SchemaVersion, Items: []itemoutcome.ItemOutcome{}},
+		},
+		{
+			name: "Valid ItemOutcomes, should pass.",
+			itemOutcomes: &itemoutcome.ItemOutcomes{
+				SchemaVersion: itemoutcome.SchemaVersion,
+				Items: []itemoutcome.ItemOutcome{
+					{
+						GroupResource: "pods",
+						Namespace:     "ns1",
+						Name:          "pod1",
+						Outcome:       itemoutcome.OutcomeBackedUp,
+					},
+				},
+			},
+			expectedResult: &itemoutcome.ItemOutcomes{
+				SchemaVersion: itemoutcome.SchemaVersion,
+				Items: []itemoutcome.ItemOutcome{
+					{
+						GroupResource: "pods",
+						Namespace:     "ns1",
+						Name:          "pod1",
+						Outcome:       itemoutcome.OutcomeBackedUp,
+					},
+				},
+			},
+		},
+	}
+
+	harness := newObjectBackupStoreTestHarness("test-bucket", "")
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.itemOutcomes != nil {
+				obj := new(bytes.Buffer)
+				gzw := gzip.NewWriter(obj)
+
+				require.NoError(t, json.NewEncoder(gzw).Encode(tc.itemOutcomes))
+				require.NoError(t, gzw.Close())
+				harness.objectStore.PutObject(harness.bucket, "backups/test-backup/test-backup-item-outcomes.json.gz", obj)
+			}
+
+			result, err := harness.GetBackupItemOutcomes("test-backup")
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedResult, result)
+		})
+	}
+}
+
+func TestPutBackupItemOutcomes(t *testing.T) {
+	harness := newObjectBackupStoreTestHarness("foo", "")
+
+	outcomes := &itemoutcome.ItemOutcomes{
+		SchemaVersion: itemoutcome.SchemaVersion,
+		Items: []itemoutcome.ItemOutcome{
+			{GroupResource: "pods", Namespace: "ns1", Name: "pod1", Outcome: itemoutcome.OutcomeBackedUp},
+		},
+	}
+
+	buf := new(bytes.Buffer)
+	gzw := gzip.NewWriter(buf)
+	require.NoError(t, json.NewEncoder(gzw).Encode(outcomes))
+	require.NoError(t, gzw.Close())
+
+	require.NoError(t, harness.PutBackupItemOutcomes("backup-1", buf))
+
+	keys, err := harness.objectStore.ListObjects("foo", "")
+	require.NoError(t, err)
+	assert.Contains(t, keys, "backups/backup-1/backup-1-item-outcomes.json.gz")
+
+	result, err := harness.GetBackupItemOutcomes("backup-1")
+	require.NoError(t, err)
+	assert.Equal(t, outcomes, result)
+}
+
+// A reader that has already been consumed must be rewound rather than uploaded
+// empty. Storing an empty artifact would look like a backup that touched no
+// items, which reads as a clean backup rather than a corrupt file.
+func TestPutBackupItemOutcomesNilReaderIsNoOp(t *testing.T) {
+	harness := newObjectBackupStoreTestHarness("foo", "")
+
+	require.NoError(t, harness.PutBackupItemOutcomes("backup-1", nil))
+
+	keys, err := harness.objectStore.ListObjects("foo", "")
+	require.NoError(t, err)
+	assert.NotContains(t, keys, "backups/backup-1/backup-1-item-outcomes.json.gz",
+		"a nil reader must store nothing rather than reach the object store")
+}
+
+// *bytes.Buffer, the type the callers actually pass, has no Seek method, so the
+// rewind in seekAndPutObject only reaches readers that implement io.Seeker. This
+// pins that path with a *bytes.Reader, which does.
+func TestPutBackupItemOutcomesRewindsSeekableReader(t *testing.T) {
+	harness := newObjectBackupStoreTestHarness("foo", "")
+
+	outcomes := &itemoutcome.ItemOutcomes{
+		SchemaVersion: itemoutcome.SchemaVersion,
+		Items: []itemoutcome.ItemOutcome{
+			{GroupResource: "pods", Namespace: "ns1", Name: "pod1", Outcome: itemoutcome.OutcomeBackedUp},
+		},
+	}
+
+	buf := new(bytes.Buffer)
+	gzw := gzip.NewWriter(buf)
+	require.NoError(t, json.NewEncoder(gzw).Encode(outcomes))
+	require.NoError(t, gzw.Close())
+
+	reader := bytes.NewReader(buf.Bytes())
+
+	// Drain the reader first, as a caller that inspected the bytes would.
+	_, err := io.ReadAll(reader)
+	require.NoError(t, err)
+
+	require.NoError(t, harness.PutBackupItemOutcomes("backup-1", reader))
+
+	result, err := harness.GetBackupItemOutcomes("backup-1")
+	require.NoError(t, err)
+	assert.Equal(t, outcomes, result, "the artifact must be the full payload, not what remained unread")
 }
 
 func TestGetRestoreVolumeInfos(t *testing.T) {

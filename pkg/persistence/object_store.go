@@ -31,6 +31,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 
 	"github.com/vmware-tanzu/velero/internal/credentials"
+	"github.com/vmware-tanzu/velero/internal/itemoutcome"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
@@ -50,7 +51,8 @@ type BackupInfo struct {
 	BackupItemOperations,
 	BackupResourceList,
 	CSIVolumeSnapshotClasses,
-	BackupVolumeInfo io.Reader
+	BackupVolumeInfo,
+	BackupItemOutcomes io.Reader
 }
 
 // BackupStore defines operations for creating, retrieving, and deleting
@@ -73,6 +75,8 @@ type BackupStore interface {
 	GetCSIVolumeSnapshotClasses(name string) ([]*snapshotv1api.VolumeSnapshotClass, error)
 	PutBackupVolumeInfos(name string, volumeInfo io.Reader) error
 	GetBackupVolumeInfos(name string) ([]*volume.BackupVolumeInfo, error)
+	PutBackupItemOutcomes(name string, itemOutcomes io.Reader) error
+	GetBackupItemOutcomes(name string) (*itemoutcome.ItemOutcomes, error)
 	GetRestoreResults(name string) (map[string]results.Result, error)
 
 	// BackupExists checks if the backup metadata file exists in object storage.
@@ -297,6 +301,7 @@ func (s *objectBackupStore) PutBackup(info BackupInfo) error {
 		s.layout.getBackupResourceListKey(info.Name):    info.BackupResourceList,
 		s.layout.getBackupResultsKey(info.Name):         info.BackupResults,
 		s.layout.getBackupVolumeInfoKey(info.Name):      info.BackupVolumeInfo,
+		s.layout.getBackupItemOutcomesKey(info.Name):    info.BackupItemOutcomes,
 	}
 
 	for key, reader := range backupObjs {
@@ -544,6 +549,42 @@ func (s *objectBackupStore) PutBackupVolumeInfos(name string, volumeInfo io.Read
 	return s.objectStore.PutObject(s.bucket, s.layout.getBackupVolumeInfoKey(name), volumeInfo)
 }
 
+// GetBackupItemOutcomes returns the per-item outcomes artifact for name, or
+// an empty result if the artifact is absent, since backups taken before this
+// feature existed (or with it disabled) won't have one.
+func (s *objectBackupStore) GetBackupItemOutcomes(name string) (*itemoutcome.ItemOutcomes, error) {
+	itemOutcomes := &itemoutcome.ItemOutcomes{SchemaVersion: itemoutcome.SchemaVersion, Items: []itemoutcome.ItemOutcome{}}
+
+	res, err := tryGet(s.objectStore, s.bucket, s.layout.getBackupItemOutcomesKey(name))
+	if err != nil {
+		return itemOutcomes, err
+	}
+	if res == nil {
+		return itemOutcomes, nil
+	}
+	defer res.Close()
+
+	if err := decode(res, itemOutcomes); err != nil {
+		return itemOutcomes, err
+	}
+
+	return itemOutcomes, nil
+}
+
+// PutBackupItemOutcomes stores the per-item outcomes artifact for name.
+//
+// It goes through seekAndPutObject like most of the other artifact writers in
+// this file. A nil reader then stores nothing rather than reaching the object
+// store, and a reader that implements io.Seeker is rewound first.
+//
+// Note that the rewind does not apply to the callers today: they pass the
+// *bytes.Buffer that encode.ToJSONGzip returns, and *bytes.Buffer has no Seek
+// method, so seekToBeginning is a no-op for it. What this buys is the nil guard
+// and one fewer writer in this file behaving unlike its neighbours.
+func (s *objectBackupStore) PutBackupItemOutcomes(name string, itemOutcomes io.Reader) error {
+	return seekAndPutObject(s.objectStore, s.bucket, s.layout.getBackupItemOutcomesKey(name), itemOutcomes)
+}
+
 func (s *objectBackupStore) GetRestoreResults(name string) (map[string]results.Result, error) {
 	results := make(map[string]results.Result)
 
@@ -683,6 +724,8 @@ func (s *objectBackupStore) GetDownloadURL(target velerov1api.DownloadTarget) (s
 		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getBackupResultsKey(target.Name), DownloadURLTTL)
 	case velerov1api.DownloadTargetKindBackupVolumeInfos:
 		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getBackupVolumeInfoKey(target.Name), DownloadURLTTL)
+	case velerov1api.DownloadTargetKindBackupItemOutcomes:
+		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getBackupItemOutcomesKey(target.Name), DownloadURLTTL)
 	case velerov1api.DownloadTargetKindRestoreVolumeInfo:
 		return s.objectStore.CreateSignedURL(s.bucket, s.layout.getRestoreVolumeInfoKey(target.Name), DownloadURLTTL)
 	default:
