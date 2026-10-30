@@ -115,6 +115,7 @@ type backupReconciler struct {
 	concurrentBackups                  int
 	globalVolumePoliciesConfigMap      string
 	knownSchedulesWithSuccessfulBackup sets.Set[string]
+	defaultCollectItemOutcomes         bool
 }
 
 func NewBackupReconciler(
@@ -144,6 +145,7 @@ func NewBackupReconciler(
 	concurrentBackups int,
 	globalCRClient kbclient.Client,
 	globalVolumePoliciesConfigMap string,
+	defaultCollectItemOutcomes bool,
 ) *backupReconciler {
 	b := &backupReconciler{
 		ctx:                           ctx,
@@ -173,6 +175,7 @@ func NewBackupReconciler(
 		concurrentBackups:             max(concurrentBackups, 1),
 		globalCRClient:                globalCRClient,
 		globalVolumePoliciesConfigMap: globalVolumePoliciesConfigMap,
+		defaultCollectItemOutcomes:    defaultCollectItemOutcomes,
 	}
 	b.updateTotalBackupMetric()
 	return b
@@ -402,7 +405,6 @@ func (b *backupReconciler) prepareBackupRequest(ctx context.Context, backup *vel
 		BackedUpItems:                 pkgbackup.NewBackedUpItemsMap(),
 		MustIncludeAdditionalItemPVCs: pkgbackup.NewBackedUpItemsMap(),
 		WorkerPool:                    pkgbackup.StartItemBlockWorkerPool(ctx, b.itemBlockWorkerCount, logger),
-		ItemOutcomes:                  itemoutcome.NewRecorder(),
 	}
 	request.VolumesInformation.Init()
 
@@ -456,6 +458,12 @@ func (b *backupReconciler) prepareBackupRequest(ctx context.Context, backup *vel
 
 	if request.Spec.SnapshotMoveData == nil {
 		request.Spec.SnapshotMoveData = &b.defaultSnapshotMoveData
+	}
+
+	collectItemOutcomes := pkgbackup.CollectItemOutcomesEnabled(request.Spec.CollectItemOutcomes, b.defaultCollectItemOutcomes)
+	request.Spec.CollectItemOutcomes = &collectItemOutcomes
+	if collectItemOutcomes {
+		request.ItemOutcomes = itemoutcome.NewRecorder()
 	}
 
 	// find which storage location to use
@@ -1132,9 +1140,14 @@ func persistBackup(backup *pkgbackup.Request,
 		persistErrs = append(persistErrs, errs...)
 	}
 
-	itemOutcomesJSON, errs := encode.ToJSONGzip(backup.ItemOutcomes.Result(), "backup item outcomes")
-	if errs != nil {
-		persistErrs = append(persistErrs, errs...)
+	// A nil recorder means the feature is disabled for this backup: write no
+	// artifact at all, rather than an empty one.
+	var itemOutcomesJSON *bytes.Buffer
+	if backup.ItemOutcomes != nil {
+		itemOutcomesJSON, errs = encode.ToJSONGzip(backup.ItemOutcomes.Result(), "backup item outcomes")
+		if errs != nil {
+			persistErrs = append(persistErrs, errs...)
+		}
 	}
 
 	if len(persistErrs) > 0 {

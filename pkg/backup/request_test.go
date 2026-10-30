@@ -80,3 +80,13 @@ func TestRequest_BackupResourceListEntriesSorted(t *testing.T) {
 		"v1/Pod": {"ns1/pod1", "ns2/pod2"},
 	}, req.BackupResourceList())
 }
+
+func TestCollectItemOutcomesEnabled(t *testing.T) {
+	assert.True(t, CollectItemOutcomesEnabled(nil, true))
+	assert.False(t, CollectItemOutcomesEnabled(nil, false))
+
+	truthy := true
+	falsy := false
+	assert.True(t, CollectItemOutcomesEnabled(&truthy, false))
+	assert.False(t, CollectItemOutcomesEnabled(&falsy, true))
+}

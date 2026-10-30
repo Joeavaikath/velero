@@ -1256,17 +1256,22 @@ func (kb *kubernetesBackupper) FinalizeBackup(
 		return err
 	}
 
-	itemOutcomes, err := backupStore.GetBackupItemOutcomes(backupRequest.Backup.Name)
-	if err != nil {
-		log.WithError(err).Errorf("fail to get the backup item outcomes for backup %s", backupRequest.Name)
-		return err
-	}
+	// A nil recorder means the feature is disabled for this backup: there is no
+	// artifact to reconcile, and GetBackupItemOutcomes would just return an
+	// empty one that updateItemOutcomes would then populate from operations.
+	if backupRequest.ItemOutcomes != nil {
+		itemOutcomes, err := backupStore.GetBackupItemOutcomes(backupRequest.Backup.Name)
+		if err != nil {
+			log.WithError(err).Errorf("fail to get the backup item outcomes for backup %s", backupRequest.Name)
+			return err
+		}
 
-	updateItemOutcomes(itemOutcomes, asyncBIAOperations, log)
+		updateItemOutcomes(itemOutcomes, asyncBIAOperations, log)
 
-	if err := putItemOutcomes(backupRequest.Name, itemOutcomes, backupStore); err != nil {
-		log.WithError(err).Errorf("fail to put the item outcomes for backup %s", backupRequest.Name)
-		return err
+		if err := putItemOutcomes(backupRequest.Name, itemOutcomes, backupStore); err != nil {
+			log.WithError(err).Errorf("fail to put the item outcomes for backup %s", backupRequest.Name)
+			return err
+		}
 	}
 
 	// write new tar archive replacing files in original with content updateFiles for matches

@@ -65,6 +65,7 @@ func mockBackupFinalizerReconciler(fakeClient kbclient.Client, fakeGlobalClient 
 		logrus.StandardLogger(),
 		metrics.NewServerMetrics(),
 		10*time.Minute,
+		false,
 	), backupper
 }
 
@@ -375,6 +376,7 @@ func TestBackupFinalizerReconcile_PutBackupMetadataFail(t *testing.T) {
 				logrus.StandardLogger(),
 				metrics.NewServerMetrics(),
 				10*time.Minute,
+				false,
 			)
 
 			localPluginManager.On("CleanupClients").Return(nil)
@@ -450,6 +452,7 @@ func TestBackupFinalizerReconcile_PutBackupContentsFail(t *testing.T) {
 				logrus.StandardLogger(),
 				metrics.NewServerMetrics(),
 				10*time.Minute,
+				false,
 			)
 
 			operations := []*itemoperation.BackupOperation{

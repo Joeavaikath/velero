@@ -71,6 +71,8 @@ type backupFinalizerReconciler struct {
 	backupStoreGetter persistence.ObjectBackupStoreGetter
 	log               logrus.FieldLogger
 	resourceTimeout   time.Duration
+
+	defaultCollectItemOutcomes bool
 }
 
 // NewBackupFinalizerReconciler initializes and returns backupFinalizerReconciler struct.
@@ -85,17 +87,19 @@ func NewBackupFinalizerReconciler(
 	log logrus.FieldLogger,
 	metrics *metrics.ServerMetrics,
 	resourceTimeout time.Duration,
+	defaultCollectItemOutcomes bool,
 ) *backupFinalizerReconciler {
 	return &backupFinalizerReconciler{
-		client:            client,
-		globalCRClient:    globalCRClient,
-		clock:             clock,
-		backupper:         backupper,
-		newPluginManager:  newPluginManager,
-		backupTracker:     backupTracker,
-		backupStoreGetter: backupStoreGetter,
-		log:               log,
-		metrics:           metrics,
+		client:                     client,
+		globalCRClient:             globalCRClient,
+		clock:                      clock,
+		backupper:                  backupper,
+		newPluginManager:           newPluginManager,
+		backupTracker:              backupTracker,
+		backupStoreGetter:          backupStoreGetter,
+		log:                        log,
+		metrics:                    metrics,
+		defaultCollectItemOutcomes: defaultCollectItemOutcomes,
 	}
 }
 
@@ -196,7 +200,9 @@ func (r *backupFinalizerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		SkippedVolumeTracker:          pkgbackup.NewSkipVolumeTracker(),
 		BackedUpItems:                 pkgbackup.NewBackedUpItemsMap(),
 		MustIncludeAdditionalItemPVCs: pkgbackup.NewBackedUpItemsMap(),
-		ItemOutcomes:                  itemoutcome.NewRecorder(),
+	}
+	if pkgbackup.CollectItemOutcomesEnabled(backup.Spec.CollectItemOutcomes, r.defaultCollectItemOutcomes) {
+		backupRequest.ItemOutcomes = itemoutcome.NewRecorder()
 	}
 	var outBackupFile *os.File
 	if len(operations) > 0 {

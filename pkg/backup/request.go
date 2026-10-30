@@ -129,6 +129,16 @@ type NamespacedFilterPattern struct {
 // BackupVolumesInformation contains the information needs by generating
 // the backup BackupVolumeInfo array.
 
+// CollectItemOutcomesEnabled returns the effective value of
+// BackupSpec.CollectItemOutcomes: the per-backup value if set, else the
+// server default.
+func CollectItemOutcomesEnabled(spec *bool, serverDefault bool) bool {
+	if spec != nil {
+		return *spec
+	}
+	return serverDefault
+}
+
 // GetItemOperationsList returns ItemOperationsList, initializing it if necessary
 func (r *Request) GetItemOperationsList() *[]*itemoperation.BackupOperation {
 	if r.itemOperationsList == nil {
