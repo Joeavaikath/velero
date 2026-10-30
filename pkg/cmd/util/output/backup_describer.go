@@ -36,6 +36,7 @@ import (
 
 	veleroapishared "github.com/vmware-tanzu/velero/pkg/apis/velero/shared"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/cmd/util/backupvolume"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/cacert"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/downloadrequest"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
@@ -330,11 +331,31 @@ func DescribeBackupStatus(ctx context.Context,
 		d.Println()
 	}
 
-	describeBackupVolumes(ctx, kbClient, d, backup, details, insecureSkipTLSVerify, caCertPath, podVolumeBackups)
+	// The volume info artifact is read once here and threaded into both sections
+	// that need it. Each used to fetch it independently, so with --details the
+	// same gzip was downloaded twice, along with two BSL cacert lookups.
+	//
+	// bslCACert is resolved once for the same reason. The warning is gated on
+	// --details to match what was printed before: the volumes section is always
+	// shown, but it used to be the item-outcomes section (only reached with
+	// --details) that produced the cacert warning, so an ungated warning here
+	// would newly surface for backups that never printed one. A failure stays
+	// best-effort either way: the download is still attempted without it.
+	bslCACert, err := cacert.GetCACertFromBackup(ctx, kbClient, backup.Namespace, backup)
+	if err != nil {
+		if details {
+			d.Printf("WARNING: Error getting cacert from BSL: %v\n", err)
+		}
+		bslCACert = ""
+	}
+
+	vols, volsErr := backupvolume.Load(ctx, kbClient, backup, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath, bslCACert)
+
+	describeBackupVolumes(ctx, kbClient, d, backup, vols, volsErr, details, insecureSkipTLSVerify, caCertPath, bslCACert, podVolumeBackups)
 
 	if details {
 		d.Println()
-		describeBackupItemOutcomes(ctx, kbClient, d, backup, insecureSkipTLSVerify, caCertPath)
+		describeBackupItemOutcomes(ctx, kbClient, d, backup, vols, volsErr, insecureSkipTLSVerify, caCertPath, bslCACert)
 	}
 
 	if status.HookStatus != nil {
@@ -382,15 +403,10 @@ func describeBackupItemOperations(ctx context.Context, kbClient kbclient.Client,
 // describeBackupItemOutcomes prints a compact summary of the per-item backup
 // outcomes artifact: counts by outcome, plus the failed/warning rows, with
 // sub-items indented under their Parent.
-func describeBackupItemOutcomes(ctx context.Context, kbClient kbclient.Client, d *Describer, backup *velerov1api.Backup, insecureSkipTLSVerify bool, caCertPath string) {
-	// Get BSL cacert if available
-	bslCACert, err := cacert.GetCACertFromBackup(ctx, kbClient, backup.Namespace, backup)
-	if err != nil {
-		// Log the error but don't fail - we can still try to download without the BSL cacert
-		d.Printf("WARNING: Error getting cacert from BSL: %v\n", err)
-		bslCACert = ""
-	}
-
+//
+// The volume info is passed in rather than read here: the caller already loaded
+// it for the volumes section, and the two must agree about the same volumes.
+func describeBackupItemOutcomes(ctx context.Context, kbClient kbclient.Client, d *Describer, backup *velerov1api.Backup, vols backupvolume.Result, volsErr error, insecureSkipTLSVerify bool, caCertPath string, bslCACert string) {
 	buf := new(bytes.Buffer)
 	if err := downloadrequest.StreamWithBSLCACert(ctx, kbClient, backup.Namespace, backup.Name, velerov1api.DownloadTargetKindBackupItemOutcomes, buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath, bslCACert); err != nil {
 		if err == downloadrequest.ErrNotFound {
@@ -412,7 +428,12 @@ func describeBackupItemOutcomes(ctx context.Context, kbClient kbclient.Client, d
 	// result lives in the separate volumeinfo artifact, joined here on
 	// (namespace, PVC name), falling back to PV name. Best-effort: a failure to
 	// read volume info degrades the report rather than dropping it.
-	volumeByItem := backupVolumeResultsByItem(ctx, kbClient, backup, insecureSkipTLSVerify, caCertPath, bslCACert)
+	volumeByItem := indexVolumeResults(vols.Volumes)
+	if volsErr != nil {
+		// Empty index: the listing still prints, it just cannot tell a benign
+		// skip from a failed volume.
+		volumeByItem = indexVolumeResults(nil)
+	}
 
 	describeItemOutcomeListing(d, &outcomes, volumeByItem)
 }
@@ -461,8 +482,12 @@ func describeItemOutcomeListing(d *Describer, outcomes *itemoutcome.ItemOutcomes
 	chains := map[itemoutcome.Key][]itemoutcome.ItemOutcome{}
 	var anchorOrder []itemoutcome.Key
 
+	// Derived once, not per row: the volume artifact does not change while the
+	// listing is built.
+	rollupVols := volumeByItem.asRollupVolumes()
+
 	for _, item := range outcomes.Items {
-		if !isNoteworthyOutcome(item, volumeByItem, byID) {
+		if !isNoteworthyOutcome(item, rollupVols, byID) {
 			continue
 		}
 
@@ -564,7 +589,7 @@ func countFailedVolumes(index *volumeResultsIndex, byID map[itemoutcome.Key]item
 			if info.Result != volume.VolumeResultFailed {
 				continue
 			}
-			key := info.PVCNamespace + "/" + info.PVCName + "/" + info.PVName
+			key := volumeIdentity(info)
 			if seen[key] {
 				continue
 			}
@@ -588,7 +613,7 @@ func summariseVolumes(index *volumeResultsIndex, rows []itemoutcome.ItemOutcome,
 			continue
 		}
 		for _, info := range volumesForItem(index, row) {
-			key := info.PVCNamespace + "/" + info.PVCName + "/" + info.PVName
+			key := volumeIdentity(info)
 			if seen[key] {
 				continue
 			}
@@ -635,26 +660,13 @@ type volumeResultsIndex struct {
 	byPV  map[string]volume.BackupVolumeInfo
 }
 
-// backupVolumeResultsByItem reads the backup's volume info artifact and indexes
-// it for joining against item outcomes. Best-effort by design: item outcomes are
-// still worth printing without volume detail, so every failure here returns an
-// empty index rather than an error.
-func backupVolumeResultsByItem(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup, insecureSkipTLSVerify bool, caCertPath string, bslCACert string) *volumeResultsIndex {
+// indexVolumeResults indexes already-decoded volume info for joining against
+// item outcomes. Reading the artifact is backupvolume.Load's job; this only
+// arranges what it returned.
+func indexVolumeResults(volumeInfos []volume.BackupVolumeInfo) *volumeResultsIndex {
 	index := &volumeResultsIndex{
 		byPVC: map[volumeItemKey]volume.BackupVolumeInfo{},
 		byPV:  map[string]volume.BackupVolumeInfo{},
-	}
-
-	buf := new(bytes.Buffer)
-	if err := downloadrequest.StreamWithBSLCACert(ctx, kbClient, backup.Namespace, backup.Name, velerov1api.DownloadTargetKindBackupVolumeInfos, buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath, bslCACert); err != nil {
-		// A pre-1.11 backup, a backup with no volumes, or a missing artifact all
-		// land here. None of them should stop item outcomes from being printed.
-		return index
-	}
-
-	var volumeInfos []volume.BackupVolumeInfo
-	if err := json.NewDecoder(buf).Decode(&volumeInfos); err != nil {
-		return index
 	}
 
 	for _, info := range volumeInfos {
@@ -696,8 +708,19 @@ func volumesForItem(index *volumeResultsIndex, item itemoutcome.ItemOutcome) []v
 // itself lives in itemoutcome.IsFailure so the rollup command and this listing
 // cannot disagree about what counts as trouble; this only adapts the describer's
 // volume index to the shape that rule takes.
-func isNoteworthyOutcome(item itemoutcome.ItemOutcome, index *volumeResultsIndex, byID map[itemoutcome.Key]itemoutcome.ItemOutcome) bool {
-	return itemoutcome.IsFailure(item, index.asRollupVolumes(), byID)
+//
+// rollupVols is passed in rather than derived here because this is called once
+// per row inside the listing loop: deriving it per call rebuilt the whole index
+// (two maps and an iteration over every volume) for an input that does not
+// change during the loop.
+func isNoteworthyOutcome(item itemoutcome.ItemOutcome, rollupVols *itemoutcome.VolumeIndex, byID map[itemoutcome.Key]itemoutcome.ItemOutcome) bool {
+	return itemoutcome.IsFailure(item, rollupVols, byID)
+}
+
+// volumeIdentity is the key that makes a volume's PVC row and its PV row resolve
+// to one volume, so a single failure is not reported twice.
+func volumeIdentity(info volume.BackupVolumeInfo) string {
+	return info.PVCNamespace + "/" + info.PVCName + "/" + info.PVName
 }
 
 // asRollupVolumes projects the describer's volume index onto the minimal shape
@@ -711,7 +734,7 @@ func (index *volumeResultsIndex) asRollupVolumes() *itemoutcome.VolumeIndex {
 	refs := make([]itemoutcome.VolumeRef, 0, len(index.byPVC)+len(index.byPV))
 	seen := map[string]bool{}
 	add := func(info volume.BackupVolumeInfo) {
-		key := info.PVCNamespace + "/" + info.PVCName + "/" + info.PVName
+		key := volumeIdentity(info)
 		if seen[key] {
 			return
 		}
@@ -838,28 +861,29 @@ func describeBackupVolumes(
 	kbClient kbclient.Client,
 	d *Describer,
 	backup *velerov1api.Backup,
+	vols backupvolume.Result,
+	volsErr error,
 	details bool,
 	insecureSkipTLSVerify bool,
 	caCertPath string,
+	bslCACert string,
 	podVolumeBackupCRs []velerov1api.PodVolumeBackup,
 ) {
 	d.Println("Backup Volumes:")
-
-	// Get BSL cacert if available
-	bslCACert, err := cacert.GetCACertFromBackup(ctx, kbClient, backup.Namespace, backup)
-	if err != nil {
-		// Log the error but don't fail - we can still try to download without the BSL cacert
-		d.Printf("WARNING: Error getting cacert from BSL: %v\n", err)
-		bslCACert = ""
-	}
 
 	nativeSnapshots := []*volume.BackupVolumeInfo{}
 	csiSnapshots := []*volume.BackupVolumeInfo{}
 	legacyInfoSource := false
 
-	buf := new(bytes.Buffer)
-	err = downloadrequest.StreamWithBSLCACert(ctx, kbClient, backup.Namespace, backup.Name, velerov1api.DownloadTargetKindBackupVolumeInfos, buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath, bslCACert)
-	if err == downloadrequest.ErrNotFound {
+	switch {
+	case volsErr != nil:
+		d.Printf("\t<error getting backup volume info: %v>\n", volsErr)
+		return
+
+	case vols.Missing:
+		// A pre-artifact backup. Reconstruct what it managed from Backup.Status so
+		// the section is not blank.
+		var err error
 		nativeSnapshots, err = retrieveNativeSnapshotLegacy(ctx, kbClient, backup, insecureSkipTLSVerify, caCertPath, bslCACert)
 		if err != nil {
 			d.Printf("\t<error concluding native snapshot info: %v>\n", err)
@@ -873,22 +897,14 @@ func describeBackupVolumes(
 		}
 
 		legacyInfoSource = true
-	} else if err != nil {
-		d.Printf("\t<error getting backup volume info: %v>\n", err)
-		return
-	} else {
-		var volumeInfos []volume.BackupVolumeInfo
-		if err := json.NewDecoder(buf).Decode(&volumeInfos); err != nil {
-			d.Printf("\t<error reading backup volume info: %v>\n", err)
-			return
-		}
 
-		for i := range volumeInfos {
-			switch volumeInfos[i].BackupMethod {
+	default:
+		for i := range vols.Volumes {
+			switch vols.Volumes[i].BackupMethod {
 			case volume.NativeSnapshot:
-				nativeSnapshots = append(nativeSnapshots, &volumeInfos[i])
+				nativeSnapshots = append(nativeSnapshots, &vols.Volumes[i])
 			case volume.CSISnapshot:
-				csiSnapshots = append(csiSnapshots, &volumeInfos[i])
+				csiSnapshots = append(csiSnapshots, &vols.Volumes[i])
 			}
 		}
 	}

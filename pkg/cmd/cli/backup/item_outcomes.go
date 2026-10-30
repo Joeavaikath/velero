@@ -35,11 +35,11 @@ import (
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/vmware-tanzu/velero/internal/itemoutcome"
-	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/client"
 	"github.com/vmware-tanzu/velero/pkg/cmd"
 	"github.com/vmware-tanzu/velero/pkg/cmd/cli"
+	"github.com/vmware-tanzu/velero/pkg/cmd/util/backupvolume"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/cacert"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/downloadrequest"
 )
@@ -143,7 +143,7 @@ func (o *ItemOutcomesOptions) Run(c *cobra.Command, f client.Factory) error {
 // outcome cannot distinguish a benign skip from a lost disk; see
 // itemoutcome.IsFailure.
 func (o *ItemOutcomesOptions) printRollup(outcomes *itemoutcome.ItemOutcomes, bslCACert string, backup *velerov1api.Backup) error {
-	vols := o.volumeRefs(bslCACert)
+	vols := o.volumeRefs(backup, bslCACert)
 	summaries := itemoutcome.Rollup(outcomes, vols)
 
 	// The artifact only covers items that were processed. A backup can fail while
@@ -420,43 +420,23 @@ func tableNamespace(namespace string) string {
 }
 
 // volumeRefs reads the backup's volume info and projects it onto the shape the
-// rollup rule takes. A backup with no volumes, or one whose volume artifact
-// cannot be read, yields an empty index rather than an error: the rollup is
-// still useful, it just cannot distinguish a benign skip from a failed volume.
-func (o *ItemOutcomesOptions) volumeRefs(bslCACert string) []itemoutcome.VolumeRef {
-	buf := new(bytes.Buffer)
-	err := downloadrequest.StreamWithBSLCACert(context.Background(), o.Client, o.backupNamespace(), o.BackupName,
-		velerov1api.DownloadTargetKindBackupVolumeInfos, buf, o.Timeout, o.InsecureSkipTLSVerify, o.CaCertFile, bslCACert)
+// rollup rule takes. A unreadable or absent artifact yields no refs rather than
+// an error: the rollup is still useful, it just cannot distinguish a benign skip
+// from a failed volume.
+//
+// A nil backup yields no refs: the artifact is addressed through the backup, so
+// there is nothing to read, and printRollup treats a nil backup as a case to
+// tolerate rather than a programmer error.
+func (o *ItemOutcomesOptions) volumeRefs(backup *velerov1api.Backup, bslCACert string) []itemoutcome.VolumeRef {
+	if backup == nil {
+		return nil
+	}
+	vols, err := backupvolume.Load(context.Background(), o.Client, backup, o.Timeout, o.InsecureSkipTLSVerify, o.CaCertFile, bslCACert)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "WARNING: could not read volume info, so a skipped volume cannot be checked against its result: %v\n", err)
 		return nil
 	}
-
-	var infos []volume.BackupVolumeInfo
-	if err := json.NewDecoder(buf).Decode(&infos); err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: could not parse volume info: %v\n", err)
-		return nil
-	}
-
-	refs := make([]itemoutcome.VolumeRef, 0, len(infos))
-	for _, info := range infos {
-		refs = append(refs, itemoutcome.VolumeRef{
-			PVCNamespace: info.PVCNamespace,
-			PVCName:      info.PVCName,
-			PVName:       info.PVName,
-			Failed:       info.Result == volume.VolumeResultFailed,
-		})
-	}
-	return refs
-}
-
-// backupNamespace is the namespace the backup lives in, resolved by the client
-// factory when the command completed.
-func (o *ItemOutcomesOptions) backupNamespace() string {
-	if o.Namespace == "" {
-		return "velero"
-	}
-	return o.Namespace
+	return backupvolume.ToRollupRefs(vols.Volumes)
 }
 
 func (o *ItemOutcomesOptions) Complete(args []string, f client.Factory) error {

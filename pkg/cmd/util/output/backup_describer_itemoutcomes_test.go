@@ -190,7 +190,7 @@ func TestIsNoteworthyOutcome(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, isNoteworthyOutcome(tc.item, index, testOutcomeIndex(tc.item)))
+			assert.Equal(t, tc.want, isNoteworthyOutcome(tc.item, index.asRollupVolumes(), testOutcomeIndex(tc.item)))
 		})
 	}
 }
