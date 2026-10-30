@@ -46,6 +46,7 @@ import (
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/vmware-tanzu/velero/internal/hook"
+	"github.com/vmware-tanzu/velero/internal/itemoutcome"
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	"github.com/vmware-tanzu/velero/internal/volumehelper"
@@ -67,6 +68,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/podvolume"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
+	"github.com/vmware-tanzu/velero/pkg/util/encode"
 	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
 
@@ -1254,6 +1256,19 @@ func (kb *kubernetesBackupper) FinalizeBackup(
 		return err
 	}
 
+	itemOutcomes, err := backupStore.GetBackupItemOutcomes(backupRequest.Backup.Name)
+	if err != nil {
+		log.WithError(err).Errorf("fail to get the backup item outcomes for backup %s", backupRequest.Name)
+		return err
+	}
+
+	updateItemOutcomes(itemOutcomes, asyncBIAOperations, log)
+
+	if err := putItemOutcomes(backupRequest.Name, itemOutcomes, backupStore); err != nil {
+		log.WithError(err).Errorf("fail to put the item outcomes for backup %s", backupRequest.Name)
+		return err
+	}
+
 	// write new tar archive replacing files in original with content updateFiles for matches
 	if err := buildFinalTarball(tr, tw, updateFiles); err != nil {
 		log.Errorf("Error building final tarball: %s", err.Error())
@@ -1406,6 +1421,113 @@ func putVolumeInfos(
 	}
 
 	return backupStore.PutBackupVolumeInfos(backupName, backupVolumeInfoBuf)
+}
+
+// updateItemOutcomes overlays the results of async BackupItemAction operations
+// onto itemOutcomes, now that the operations have settled. A Failed operation
+// upgrades its item to OutcomeFailed with the operation's error appended; a
+// Completed operation leaves the item unchanged, because the item was backed up
+// synchronously and the operation finishing only confirms it. Operations with no
+// matching item (e.g. one targeting an item that was never otherwise observed)
+// get a row of their own, so the artifact still accounts for them. Parent is
+// never touched here: it is set once at capture time and carried through
+// unchanged on both matched and unmatched rows.
+//
+// The overlay is monotone: it only ever raises an outcome, so a verdict recorded
+// at capture time cannot be lost by the finalize write.
+//
+// This relies on every operation being terminal by the time it runs, which is
+// enforced elsewhere: the operations controller moves the backup to a finalizing
+// phase only when nothing is left in progress
+// (pkg/controller/backup_operations_controller.go:205-212), and the finalizer
+// controller refuses to finalize a backup that is not in one of those phases
+// (pkg/controller/backup_finalizer_controller.go:146). A New or InProgress
+// operation reaching here has no verdict to copy, so it would leave its item
+// reading whatever capture recorded; that case is reported rather than silently
+// accepted, because it means the guarantee above has been broken.
+func updateItemOutcomes(itemOutcomes *itemoutcome.ItemOutcomes, operations []*itemoperation.BackupOperation, log logrus.FieldLogger) {
+	index := make(map[velero.ResourceIdentifier]*itemoutcome.ItemOutcome, len(itemOutcomes.Items))
+	for i := range itemOutcomes.Items {
+		item := &itemOutcomes.Items[i]
+		id := velero.ResourceIdentifier{
+			GroupResource: schema.ParseGroupResource(item.GroupResource),
+			Namespace:     item.Namespace,
+			Name:          item.Name,
+		}
+		index[id] = item
+	}
+
+	for _, operation := range operations {
+		switch operation.Status.Phase {
+		case itemoperation.OperationPhaseFailed:
+		case itemoperation.OperationPhaseCompleted:
+			// The item was backed up synchronously and the operation finished
+			// successfully, so the row already holds the right verdict.
+			continue
+		default:
+			// The backup should not reach finalize while an operation is
+			// running. Say so rather than letting the row's existing outcome
+			// stand in for a verdict that was never delivered.
+			log.WithFields(logrus.Fields{
+				"groupResource": operation.Spec.ResourceIdentifier.GroupResource.String(),
+				"namespace":     operation.Spec.ResourceIdentifier.Namespace,
+				"name":          operation.Spec.ResourceIdentifier.Name,
+				"phase":         operation.Status.Phase,
+			}).Warn("Item operation is not terminal at finalize; its outcome was not applied to the item outcomes artifact")
+			continue
+		}
+
+		id := operation.Spec.ResourceIdentifier
+		item, ok := index[id]
+		if !ok {
+			itemOutcomes.Items = append(itemOutcomes.Items, itemoutcome.ItemOutcome{
+				GroupResource: id.GroupResource.String(),
+				Namespace:     id.Namespace,
+				Name:          id.Name,
+				Outcome:       itemoutcome.OutcomeFailed,
+			})
+			item = &itemOutcomes.Items[len(itemOutcomes.Items)-1]
+			index[id] = item
+		} else {
+			item.Outcome = itemoutcome.OutcomeFailed
+		}
+
+		if operation.Status.Error != "" {
+			// The same text is stored by the operations controller in
+			// <backup>-itemoperations.json.gz (uploaded by
+			// pkg/itemoperationmap/backup_operation_map.go:158), which remains the
+			// source of record for an async failure: it also holds the operation
+			// ID, the plugin name and the phase, none of which is copied here.
+			//
+			// The copy is deliberate. A row reading Failed with no message sends
+			// the reader to another artifact to learn anything at all, and this
+			// artifact's job is to answer the per-item question on its own where
+			// it can. Duplicating one string is cheaper than that, and the two
+			// cannot disagree: the finalize pass reads its operation list back
+			// out of <backup>-itemoperations.json.gz
+			// (pkg/controller/backup_finalizer_controller.go:191) and passes that
+			// slice here, so the message written is the one already stored.
+			//
+			// Invariant: this is the only place the overlay touches Messages, and
+			// it only appends. Nothing at finalize rewrites or removes a message
+			// recorded during capture, so the finalize write can only add detail
+			// to a row, never replace what the item said about itself.
+			item.Messages = append(item.Messages, operation.Status.Error)
+		}
+	}
+}
+
+func putItemOutcomes(
+	backupName string,
+	itemOutcomes *itemoutcome.ItemOutcomes,
+	backupStore persistence.BackupStore,
+) error {
+	buf, errs := encode.ToJSONGzip(itemOutcomes, "backup item outcomes")
+	if errs != nil {
+		return kubeerrs.NewAggregate(errs)
+	}
+
+	return backupStore.PutBackupItemOutcomes(backupName, buf)
 }
 
 func resolveClusterScopedFilterPolicy(

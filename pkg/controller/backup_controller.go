@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"time"
@@ -1131,6 +1132,11 @@ func persistBackup(backup *pkgbackup.Request,
 		persistErrs = append(persistErrs, errs...)
 	}
 
+	itemOutcomesJSON, errs := encode.ToJSONGzip(backup.ItemOutcomes.Result(), "backup item outcomes")
+	if errs != nil {
+		persistErrs = append(persistErrs, errs...)
+	}
+
 	if len(persistErrs) > 0 {
 		// Don't upload the JSON files or backup tarball if encoding to json fails.
 		backupJSON = nil
@@ -1141,6 +1147,19 @@ func persistBackup(backup *pkgbackup.Request,
 		csiSnapshotClassesJSON = nil
 		backupResult = nil
 		volumeInfoJSON = nil
+		itemOutcomesJSON = nil
+	}
+
+	// itemOutcomesJSON is the only one of these that can be nil on the
+	// success path (whenever the feature is disabled for this backup), so it
+	// is the only one that needs this guard: assigning a nil *bytes.Buffer
+	// directly to the BackupItemOutcomes io.Reader field would store a
+	// non-nil interface wrapping a nil pointer, which later nil-checks
+	// (e.g. in seekAndPutObject) can't detect, causing a panic when it's
+	// read from. Leaving the interface itself nil avoids that trap.
+	var backupItemOutcomesReader io.Reader
+	if itemOutcomesJSON != nil {
+		backupItemOutcomesReader = itemOutcomesJSON
 	}
 
 	backupInfo := persistence.BackupInfo{
@@ -1155,6 +1174,7 @@ func persistBackup(backup *pkgbackup.Request,
 		BackupResourceList:       backupResourceList,
 		CSIVolumeSnapshotClasses: csiSnapshotClassesJSON,
 		BackupVolumeInfo:         volumeInfoJSON,
+		BackupItemOutcomes:       backupItemOutcomesReader,
 	}
 	if err := backupStore.PutBackup(backupInfo); err != nil {
 		persistErrs = append(persistErrs, err)

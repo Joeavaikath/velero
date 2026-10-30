@@ -6122,6 +6122,247 @@ func TestPutVolumeInfos(t *testing.T) {
 	require.NoError(t, putVolumeInfos(backupName, []*volume.BackupVolumeInfo{}, backupStore))
 }
 
+func TestUpdateItemOutcomes(t *testing.T) {
+	now := metav1.Now()
+
+	tests := []struct {
+		name            string
+		itemOutcomes    *itemoutcome.ItemOutcomes
+		operations      []*itemoperation.BackupOperation
+		expectedResults map[string]itemoutcome.Outcome
+		expectedCount   int
+	}{
+		{
+			name: "failed operation upgrades a previously BackedUp item to Failed and appends the error",
+			itemOutcomes: &itemoutcome.ItemOutcomes{
+				SchemaVersion: itemoutcome.SchemaVersion,
+				Items: []itemoutcome.ItemOutcome{
+					{GroupResource: "persistentvolumeclaims", Namespace: "ns-1", Name: "pvc-1", Outcome: itemoutcome.OutcomeBackedUp},
+				},
+			},
+			operations: []*itemoperation.BackupOperation{
+				{
+					Spec: itemoperation.BackupOperationSpec{
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: schema.GroupResource{Resource: "persistentvolumeclaims"},
+							Namespace:     "ns-1",
+							Name:          "pvc-1",
+						},
+					},
+					Status: itemoperation.OperationStatus{Phase: itemoperation.OperationPhaseFailed, Error: "snapshot timed out", Created: &now},
+				},
+			},
+			expectedResults: map[string]itemoutcome.Outcome{"pvc-1": itemoutcome.OutcomeFailed},
+			expectedCount:   1,
+		},
+		{
+			name: "completed operation leaves the item unchanged",
+			itemOutcomes: &itemoutcome.ItemOutcomes{
+				SchemaVersion: itemoutcome.SchemaVersion,
+				Items: []itemoutcome.ItemOutcome{
+					{GroupResource: "persistentvolumeclaims", Namespace: "ns-1", Name: "pvc-1", Outcome: itemoutcome.OutcomeBackedUp},
+				},
+			},
+			operations: []*itemoperation.BackupOperation{
+				{
+					Spec: itemoperation.BackupOperationSpec{
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: schema.GroupResource{Resource: "persistentvolumeclaims"},
+							Namespace:     "ns-1",
+							Name:          "pvc-1",
+						},
+					},
+					Status: itemoperation.OperationStatus{Phase: itemoperation.OperationPhaseCompleted, Created: &now},
+				},
+			},
+			expectedResults: map[string]itemoutcome.Outcome{"pvc-1": itemoutcome.OutcomeBackedUp},
+			expectedCount:   1,
+		},
+		{
+			name: "failed operation with no matching item gets its own row",
+			itemOutcomes: &itemoutcome.ItemOutcomes{
+				SchemaVersion: itemoutcome.SchemaVersion,
+				Items:         []itemoutcome.ItemOutcome{},
+			},
+			operations: []*itemoperation.BackupOperation{
+				{
+					Spec: itemoperation.BackupOperationSpec{
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: schema.GroupResource{Resource: "persistentvolumeclaims"},
+							Namespace:     "ns-1",
+							Name:          "pvc-unseen",
+						},
+					},
+					Status: itemoperation.OperationStatus{Phase: itemoperation.OperationPhaseFailed, Error: "boom", Created: &now},
+				},
+			},
+			expectedResults: map[string]itemoutcome.Outcome{"pvc-unseen": itemoutcome.OutcomeFailed},
+			expectedCount:   1,
+		},
+		{
+			name: "parent is untouched by the overlay",
+			itemOutcomes: &itemoutcome.ItemOutcomes{
+				SchemaVersion: itemoutcome.SchemaVersion,
+				Items: []itemoutcome.ItemOutcome{
+					{
+						GroupResource: "persistentvolumeclaims",
+						Namespace:     "ns-1",
+						Name:          "pvc-1",
+						Outcome:       itemoutcome.OutcomeBackedUp,
+						Parent:        &itemoutcome.ItemRef{GroupResource: "virtualmachines.kubevirt.io", Namespace: "ns-1", Name: "vm-1"},
+					},
+				},
+			},
+			operations: []*itemoperation.BackupOperation{
+				{
+					Spec: itemoperation.BackupOperationSpec{
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: schema.GroupResource{Resource: "persistentvolumeclaims"},
+							Namespace:     "ns-1",
+							Name:          "pvc-1",
+						},
+					},
+					Status: itemoperation.OperationStatus{Phase: itemoperation.OperationPhaseFailed, Error: "boom", Created: &now},
+				},
+			},
+			expectedResults: map[string]itemoutcome.Outcome{"pvc-1": itemoutcome.OutcomeFailed},
+			expectedCount:   1,
+		},
+		{
+			// The backup is not supposed to reach finalize with a running
+			// operation, but if it does the item must not gain a row or a verdict
+			// it never earned. It keeps what capture recorded and the condition is
+			// reported.
+			name: "in-flight operation neither creates nor changes a row",
+			itemOutcomes: &itemoutcome.ItemOutcomes{
+				SchemaVersion: itemoutcome.SchemaVersion,
+				Items: []itemoutcome.ItemOutcome{
+					{GroupResource: "persistentvolumeclaims", Namespace: "ns-1", Name: "pvc-1", Outcome: itemoutcome.OutcomeBackedUp},
+				},
+			},
+			operations: []*itemoperation.BackupOperation{
+				{
+					Spec: itemoperation.BackupOperationSpec{
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: schema.GroupResource{Resource: "persistentvolumeclaims"},
+							Namespace:     "ns-1",
+							Name:          "pvc-1",
+						},
+					},
+					Status: itemoperation.OperationStatus{Phase: itemoperation.OperationPhaseInProgress, Created: &now},
+				},
+			},
+			expectedResults: map[string]itemoutcome.Outcome{"pvc-1": itemoutcome.OutcomeBackedUp},
+			expectedCount:   1,
+		},
+		{
+			name: "unstarted operation for an unseen item does not invent a row",
+			itemOutcomes: &itemoutcome.ItemOutcomes{
+				SchemaVersion: itemoutcome.SchemaVersion,
+				Items:         []itemoutcome.ItemOutcome{},
+			},
+			operations: []*itemoperation.BackupOperation{
+				{
+					Spec: itemoperation.BackupOperationSpec{
+						ResourceIdentifier: velero.ResourceIdentifier{
+							GroupResource: schema.GroupResource{Resource: "persistentvolumeclaims"},
+							Namespace:     "ns-1",
+							Name:          "pvc-unseen",
+						},
+					},
+					Status: itemoperation.OperationStatus{Phase: itemoperation.OperationPhaseNew, Created: &now},
+				},
+			},
+			expectedResults: map[string]itemoutcome.Outcome{},
+			expectedCount:   0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			updateItemOutcomes(tc.itemOutcomes, tc.operations, logrus.New())
+
+			require.Len(t, tc.itemOutcomes.Items, tc.expectedCount)
+
+			byName := map[string]itemoutcome.ItemOutcome{}
+			for _, item := range tc.itemOutcomes.Items {
+				byName[item.Name] = item
+			}
+			for name, outcome := range tc.expectedResults {
+				assert.Equal(t, outcome, byName[name].Outcome)
+			}
+
+			if tc.name == "parent is untouched by the overlay" {
+				require.NotNil(t, byName["pvc-1"].Parent)
+				assert.Equal(t, "vm-1", byName["pvc-1"].Parent.Name)
+				assert.Contains(t, byName["pvc-1"].Messages, "boom")
+			}
+		})
+	}
+}
+
+// TestUpdateItemOutcomesKeepsCaptureMessages pins the append-only invariant
+// stated beside the Messages write in updateItemOutcomes: the finalize overlay
+// adds the async operation's error but never rewrites or drops what capture
+// recorded. If this ever fails, a row has silently lost what the item said
+// about itself, which is the failure the invariant exists to rule out.
+func TestUpdateItemOutcomesKeepsCaptureMessages(t *testing.T) {
+	now := metav1.Now()
+
+	captureMessages := []string{
+		"volume snapshot for pvc-1 could not be taken, backing up the contents instead",
+		"including item because it is a PVC referenced by pending pod ns-1/pod-1",
+	}
+
+	itemOutcomes := &itemoutcome.ItemOutcomes{
+		SchemaVersion: itemoutcome.SchemaVersion,
+		Items: []itemoutcome.ItemOutcome{
+			{
+				GroupResource: "persistentvolumeclaims",
+				Namespace:     "ns-1",
+				Name:          "pvc-1",
+				Outcome:       itemoutcome.OutcomeWarning,
+				Messages:      captureMessages,
+			},
+		},
+	}
+
+	updateItemOutcomes(itemOutcomes, []*itemoperation.BackupOperation{
+		{
+			Spec: itemoperation.BackupOperationSpec{
+				ResourceIdentifier: velero.ResourceIdentifier{
+					GroupResource: schema.GroupResource{Resource: "persistentvolumeclaims"},
+					Namespace:     "ns-1",
+					Name:          "pvc-1",
+				},
+			},
+			Status: itemoperation.OperationStatus{Phase: itemoperation.OperationPhaseFailed, Error: "snapshot timed out", Created: &now},
+		},
+	}, logrus.New())
+
+	require.Len(t, itemOutcomes.Items, 1)
+	item := itemOutcomes.Items[0]
+
+	// The verdict is upgraded, not replaced wholesale: the row keeps its identity.
+	assert.Equal(t, itemoutcome.OutcomeFailed, item.Outcome)
+	assert.Equal(t, "pvc-1", item.Name)
+
+	// Every capture-time message survives, in order, ahead of the appended error.
+	require.Len(t, item.Messages, len(captureMessages)+1)
+	assert.Equal(t, captureMessages, item.Messages[:len(captureMessages)])
+	assert.Equal(t, "snapshot timed out", item.Messages[len(captureMessages)])
+}
+
+func TestPutItemOutcomes(t *testing.T) {
+	backupName := "backup-01"
+
+	backupStore := new(persistencemocks.BackupStore)
+
+	backupStore.On("PutBackupItemOutcomes", mock.Anything, mock.Anything).Return(nil)
+
+	require.NoError(t, putItemOutcomes(backupName, &itemoutcome.ItemOutcomes{SchemaVersion: itemoutcome.SchemaVersion, Items: []itemoutcome.ItemOutcome{}}, backupStore))
+}
+
 type fakeSingleObjectBackupStoreGetter struct {
 	store persistence.BackupStore
 }
