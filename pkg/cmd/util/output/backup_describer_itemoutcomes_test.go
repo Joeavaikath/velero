@@ -237,7 +237,7 @@ func TestSummariseVolumesNoVolumes(t *testing.T) {
 	children := []itemoutcome.ItemOutcome{
 		pvcOutcome("vm-ns", "disk-0", itemoutcome.OutcomeBackedUp, nil),
 	}
-	assert.Equal(t, "", summariseVolumes(testVolumeIndex(), children, map[itemoutcome.Key]itemoutcome.ItemOutcome{}))
+	assert.Empty(t, summariseVolumes(testVolumeIndex(), children, map[itemoutcome.Key]itemoutcome.ItemOutcome{}))
 }
 
 func TestDescribeVolumeResult(t *testing.T) {

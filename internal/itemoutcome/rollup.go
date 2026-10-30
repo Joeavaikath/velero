@@ -92,54 +92,20 @@ func Rollup(items *ItemOutcomes, vols []VolumeRef) []OwnerSummary {
 		return nil
 	}
 
-	byID := IndexByKey(items)
-	parentOf := ParentMap(byID)
-	index := IndexVolumes(vols)
+	summaries := Summarize(items, vols)
+	parentOf := ParentMap(IndexByKey(items))
 
-	summaries := map[Key]*OwnerSummary{}
-	var order []Key
-	notable := map[Key][]ItemOutcome{}
-
-	for _, item := range items.Items {
-		root := ResolveRoot(parentOf, KeyOf(item))
-		summary, seen := summaries[root]
-		if !seen {
-			summary = &OwnerSummary{
-				Owner:   ItemRef(root),
-				Outcome: OutcomeBackedUp,
-				Counts:  map[Outcome]int{},
-			}
-			summaries[root] = summary
-			order = append(order, root)
-		}
-
-		summary.Counts[item.Outcome]++
-		if IsFailure(item, index, byID) {
-			notable[root] = append(notable[root], item)
-			if precedence[item.Outcome] > precedence[summary.Outcome] {
-				summary.Outcome = item.Outcome
-			}
-		}
+	// ResolveRoot rather than "has no parent": a malformed artifact can hold a
+	// cycle, and a cycle has no root at all. Asking each row for its root keeps
+	// the result non-empty there instead of silently summarizing nothing.
+	roots := map[Key]bool{}
+	for key := range summaries {
+		roots[ResolveRoot(parentOf, key)] = true
 	}
 
-	result := make([]OwnerSummary, 0, len(order))
-	for _, root := range order {
-		summary := summaries[root]
-		// Report the rows at the summary's own severity. A Failed owner should not
-		// be explained by a list of warnings.
-		for _, item := range notable[root] {
-			if precedence[item.Outcome] != precedence[summary.Outcome] {
-				continue
-			}
-			summary.Failed = append(summary.Failed, ItemRef{
-				GroupResource: item.GroupResource, Namespace: item.Namespace, Name: item.Name,
-			})
-		}
-		sort.Slice(summary.Failed, func(i, j int) bool {
-			return summary.Failed[i].GroupResource+summary.Failed[i].Name <
-				summary.Failed[j].GroupResource+summary.Failed[j].Name
-		})
-		result = append(result, *summary)
+	result := make([]OwnerSummary, 0, len(roots))
+	for root := range roots {
+		result = append(result, summaries[root])
 	}
 
 	sort.Slice(result, func(i, j int) bool {
@@ -157,6 +123,108 @@ func Rollup(items *ItemOutcomes, vols []VolumeRef) []OwnerSummary {
 	})
 
 	return result
+}
+
+// Summarize returns one summary per row, each covering that row and everything
+// the artifact records beneath it. A row carries the worst outcome anywhere in
+// its subtree, so an ancestor shows the trouble its descendants caused — which
+// is what lets a nested view put a verdict on every level rather than only on
+// the root. Rollup is the roots-only projection of this.
+//
+// Counting a row at every level means a row appears in more than one summary.
+// That is the point: the same disk failure is part of the PVC's summary, the
+// pod's, the VMI's and the VM's, and a reader at any depth sees it.
+func Summarize(items *ItemOutcomes, vols []VolumeRef) map[Key]OwnerSummary {
+	if items == nil {
+		return nil
+	}
+
+	byID := IndexByKey(items)
+	parentOf := ParentMap(byID)
+	index := IndexVolumes(vols)
+
+	summaries := make(map[Key]OwnerSummary, len(byID))
+	notable := map[Key][]ItemOutcome{}
+	visited := map[Key]bool{}
+
+	for _, item := range items.Items {
+		failure := IsFailure(item, index, byID)
+
+		// Walk from the row up its chain, counting it at every level. visited
+		// bounds the walk so a cycle counts a row once instead of inflating
+		// every level it loops through.
+		clear(visited)
+		for node, depth := KeyOf(item), 0; depth <= MaxDepth && !visited[node]; depth++ {
+			visited[node] = true
+
+			summary, seen := summaries[node]
+			if !seen {
+				summary = OwnerSummary{
+					Owner:   ItemRef(node),
+					Outcome: OutcomeBackedUp,
+					Counts:  map[Outcome]int{},
+				}
+			}
+
+			summary.Counts[item.Outcome]++
+			if failure {
+				notable[node] = append(notable[node], item)
+				if raised := failureOutcome(item); precedence[raised] > precedence[summary.Outcome] {
+					summary.Outcome = raised
+				}
+			}
+			summaries[node] = summary
+
+			parent, ok := parentOf[node]
+			if !ok {
+				break
+			}
+			node = parent
+		}
+	}
+
+	for node, summary := range summaries {
+		// Report the rows at the summary's own severity. A Failed owner should not
+		// be explained by a list of warnings. The comparison is on failureOutcome,
+		// the same value that raised the summary: a row whose failing volume
+		// raised it to Failed must appear in Failed, or Outcome and Failed would
+		// contradict each other.
+		for _, item := range notable[node] {
+			if precedence[failureOutcome(item)] != precedence[summary.Outcome] {
+				continue
+			}
+			summary.Failed = append(summary.Failed, ItemRef{
+				GroupResource: item.GroupResource, Namespace: item.Namespace, Name: item.Name,
+			})
+		}
+		sort.Slice(summary.Failed, func(i, j int) bool {
+			return summary.Failed[i].GroupResource+summary.Failed[i].Name <
+				summary.Failed[j].GroupResource+summary.Failed[j].Name
+		})
+		summaries[node] = summary
+	}
+
+	return summaries
+}
+
+// failureOutcome is the outcome a summary should take on for a row that
+// IsFailure judged to be trouble.
+//
+// It is normally the row's own outcome. The exception is a row that reads
+// BackedUp but whose volume failed: the item was captured, and its disk was
+// not, so the failure is real and the row's verdict understates it. Left as
+// BackedUp the summary would name the row in Failed while its Outcome stayed
+// clean, and every caller that asks "is this chain in trouble?" by reading
+// Outcome alone -- the item-outcomes command's listing gate does exactly that --
+// would report the backup as clean.
+//
+// Nothing is fabricated: the failure is what IsFailure already decided, and the
+// row itself keeps its own verdict. Only the rollup's summary is raised.
+func failureOutcome(item ItemOutcome) Outcome {
+	if item.Outcome == OutcomeBackedUp {
+		return OutcomeFailed
+	}
+	return item.Outcome
 }
 
 // IndexByKey maps each row to its key so parenting links can be followed.

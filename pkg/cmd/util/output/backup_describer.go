@@ -500,7 +500,7 @@ func describeItemOutcomeListing(d *Describer, outcomes *itemoutcome.ItemOutcomes
 			continue
 		}
 
-		// Summarise the whole chain, not just its noteworthy rows: "1 of 2 volumes
+		// Summarize the whole chain, not just its noteworthy rows: "1 of 2 volumes
 		// failed" needs the clean disk counted too.
 		summary := summariseVolumes(volumeByItem, chains[root], byID)
 		if summary != "" {

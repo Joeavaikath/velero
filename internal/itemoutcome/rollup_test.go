@@ -176,8 +176,54 @@ func TestRollupCountsOneFailedVolumeOnce(t *testing.T) {
 	summaries := Rollup(outcomes, vols)
 
 	require.Len(t, summaries, 1)
-	assert.Equal(t, OutcomeBackedUp, summaries[0].Outcome,
-		"the failed volume is attributed to the PVC, and the PVC row itself is BackedUp, so nothing is noteworthy here")
+	// The volume is counted once even though both the PVC and its PV resolve to
+	// it, and one failed disk is enough to make the chain trouble.
+	assert.Equal(t, OutcomeFailed, summaries[0].Outcome)
+	assert.Len(t, summaries[0].Failed, 1,
+		"one failed volume must be named once, not once per identity that resolves to it")
+}
+
+// A row can be judgement-proof: captured by Velero, with a disk that was not.
+// Its own verdict stays BackedUp, but the chain it belongs to is in trouble, and
+// the rollup must say so -- otherwise a caller reading only Outcome reports the
+// backup as clean while the same summary names a failed row beneath it.
+func TestRollupRaisesBackedUpRowWhoseVolumeFailed(t *testing.T) {
+	outcomes := &ItemOutcomes{
+		SchemaVersion: SchemaVersion,
+		Items: []ItemOutcome{
+			row(pvcGR, "ns", "data", OutcomeBackedUp, nil),
+		},
+	}
+	vols := []VolumeRef{{PVCNamespace: "ns", PVCName: "data", PVName: "pv-data", Failed: true}}
+
+	summaries := Rollup(outcomes, vols)
+
+	require.Len(t, summaries, 1)
+	assert.Equal(t, OutcomeFailed, summaries[0].Outcome,
+		"a failed volume under a captured item is trouble, not a clean verdict")
+	require.Len(t, summaries[0].Failed, 1)
+	assert.Equal(t, "data", summaries[0].Failed[0].Name)
+
+	// The row keeps the verdict it was given: only the rollup is raised.
+	assert.Equal(t, OutcomeBackedUp, outcomes.Items[0].Outcome)
+}
+
+// A skip whose volume succeeded is still not trouble, and the raise must not
+// make it one.
+func TestRollupDoesNotRaiseBenignSkip(t *testing.T) {
+	outcomes := &ItemOutcomes{
+		SchemaVersion: SchemaVersion,
+		Items: []ItemOutcome{
+			row(pvcGR, "ns", "data", OutcomeSkipped, nil),
+		},
+	}
+	vols := []VolumeRef{{PVCNamespace: "ns", PVCName: "data", PVName: "pv-data"}}
+
+	summaries := Rollup(outcomes, vols)
+
+	require.Len(t, summaries, 1)
+	assert.Equal(t, OutcomeBackedUp, summaries[0].Outcome)
+	assert.Empty(t, summaries[0].Failed)
 }
 
 // A cycle must terminate rather than loop, and each row still lands in a chain.
@@ -193,6 +239,45 @@ func TestRollupTerminatesOnCyclicArtifact(t *testing.T) {
 
 func TestRollupHandlesNilArtifact(t *testing.T) {
 	assert.Nil(t, Rollup(nil, nil))
+}
+
+// Summarize is what lets a nested view put a verdict on every level rather than
+// only on the root, so each ancestor must carry its descendants' trouble.
+func TestSummarizeAttributesFailuresToEveryAncestor(t *testing.T) {
+	outcomes := kubeVirtChain(OutcomeFailed)
+
+	summaries := Summarize(outcomes, nil)
+
+	vm := Key{GroupResource: vmGR, Namespace: "ns", Name: "vm1"}
+	vmi := Key{GroupResource: "virtualmachineinstances.kubevirt.io", Namespace: "ns", Name: "vm1"}
+	pod := Key{GroupResource: "pods", Namespace: "ns", Name: "virt-launcher-vm1"}
+	pvc := Key{GroupResource: pvcGR, Namespace: "ns", Name: "disk1"}
+
+	for _, key := range []Key{vm, vmi, pod, pvc} {
+		require.Contains(t, summaries, key)
+	}
+	// The verdict propagates to every ancestor: an owner is only explicable if
+	// the rows beneath it are visible.
+	assert.Equal(t, OutcomeFailed, summaries[vm].Outcome)
+	assert.Equal(t, OutcomeFailed, summaries[vmi].Outcome)
+	assert.Equal(t, OutcomeFailed, summaries[pod].Outcome)
+
+	// Counts are per-row outcomes, not "contains trouble": exactly one row in
+	// this chain failed, so every level counts one failure. What grows is the
+	// number of rows the level owns.
+	total := func(s OwnerSummary) int {
+		n := 0
+		for _, c := range s.Counts {
+			n += c
+		}
+		return n
+	}
+	assert.Equal(t, 1, summaries[pvc].Counts[OutcomeFailed])
+	assert.Greater(t, total(summaries[vm]), total(summaries[pvc]))
+}
+
+func TestSummarizeHandlesNilArtifact(t *testing.T) {
+	assert.Nil(t, Summarize(nil, nil))
 }
 
 func TestRollupEmptyArtifact(t *testing.T) {

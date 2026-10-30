@@ -107,9 +107,8 @@ func TestObservePromotesNamedToBackedUp(t *testing.T) {
 	r.SetParent(child, pod("ns1", "pod1"))
 	r.Observe(child)
 
-	items := r.Result().Items
-	require.Len(t, items, 1)
-	assert.Equal(t, OutcomeBackedUp, items[0].Outcome,
+	rows := IndexByKey(r.Result())
+	assert.Equal(t, OutcomeBackedUp, rows[Key{GroupResource: "persistentvolumeclaims", Namespace: "ns1", Name: "data-disk"}].Outcome,
 		"processing the item resolves the edge-only row into a real verdict")
 }
 
@@ -120,9 +119,29 @@ func TestVerdictSurvivesEdgeArrivingLater(t *testing.T) {
 	r.Fail(child, "snapshot denied")
 	r.SetParent(child, pod("ns1", "pod1"))
 
-	items := r.Result().Items
-	require.Len(t, items, 1)
-	assert.Equal(t, OutcomeFailed, items[0].Outcome)
+	rows := IndexByKey(r.Result())
+	assert.Equal(t, OutcomeFailed, rows[Key{GroupResource: "persistentvolumeclaims", Namespace: "ns1", Name: "data-disk"}].Outcome)
+}
+
+// A chain whose rows are all Named is summarized as BackedUp, exactly as a chain
+// whose rows are all Skipped is: the summary answers "is this trouble", and the
+// per-row verdict is where the distinction lives.
+func TestAllNamedChainSummarizesLikeAllSkipped(t *testing.T) {
+	named := &ItemOutcomes{SchemaVersion: SchemaVersion, Items: []ItemOutcome{
+		{GroupResource: "persistentvolumeclaims", Namespace: "ns1", Name: "a", Outcome: OutcomeNamed},
+	}}
+	skipped := &ItemOutcomes{SchemaVersion: SchemaVersion, Items: []ItemOutcome{
+		{GroupResource: "persistentvolumeclaims", Namespace: "ns1", Name: "a", Outcome: OutcomeSkipped},
+	}}
+
+	n := Summarize(named, nil)[Key{GroupResource: "persistentvolumeclaims", Namespace: "ns1", Name: "a"}]
+	s := Summarize(skipped, nil)[Key{GroupResource: "persistentvolumeclaims", Namespace: "ns1", Name: "a"}]
+
+	assert.Equal(t, s.Outcome, n.Outcome)
+	assert.Equal(t, OutcomeBackedUp, n.Outcome)
+	assert.Equal(t, map[Outcome]int{OutcomeNamed: 1}, n.Counts)
+	assert.False(t, IsFailure(named.Items[0], IndexVolumes(nil), IndexByKey(named)),
+		"Named is not trouble, the same way a benign skip is not")
 }
 
 func TestWarnUpgradesFromBackedUp(t *testing.T) {
