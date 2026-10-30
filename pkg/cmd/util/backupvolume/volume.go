@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,6 +57,11 @@ type Result struct {
 // callers that have a fallback can take it. A transport or decode failure is
 // returned as an error because neither caller can say anything useful about the
 // volumes without the bytes.
+// DecodeError reports that the artifact was fetched but could not be read. The
+// structured describer distinguishes it from a fetch failure because it has
+// always reported the two under different keys, and a consumer may key on them.
+var DecodeError = errors.New("backup volume info could not be decoded")
+
 func Load(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup, timeout time.Duration, insecureSkipTLSVerify bool, caCertPath string, bslCACert string) (Result, error) {
 	buf := new(bytes.Buffer)
 	err := downloadrequest.StreamWithBSLCACert(ctx, kbClient, backup.Namespace, backup.Name,
@@ -68,7 +75,7 @@ func Load(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Bac
 
 	var infos []volume.BackupVolumeInfo
 	if err := json.NewDecoder(buf).Decode(&infos); err != nil {
-		return Result{}, err
+		return Result{}, fmt.Errorf("%w: %w", DecodeError, err)
 	}
 
 	return Result{Volumes: infos}, nil

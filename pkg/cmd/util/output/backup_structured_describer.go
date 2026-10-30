@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -28,9 +29,11 @@ import (
 
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/vmware-tanzu/velero/internal/itemoutcome"
 	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
+	"github.com/vmware-tanzu/velero/pkg/cmd/util/backupvolume"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/cacert"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/downloadrequest"
 	"github.com/vmware-tanzu/velero/pkg/util/results"
@@ -215,6 +218,19 @@ func DescribeBackupStatusInSF(ctx context.Context, kbClient kbclient.Client, d *
 
 	defer d.Describe("status", backupStatusInfo)
 
+	// Resolved once and passed down: the volume info artifact is read by the
+	// volume listing and, under --details, by the item outcomes join, and
+	// downloading it twice for one command would be a needless round trip on
+	// the same bytes. The cacert failure is handed to the volume listing rather
+	// than reported here, so the warning keeps appearing under the same key it
+	// always has.
+	bslCACert, bslCACertErr := cacert.GetCACertFromBackup(ctx, kbClient, backup.Namespace, backup)
+	if bslCACertErr != nil {
+		// Not fatal: the artifacts can still be downloaded without the BSL cacert.
+		bslCACert = ""
+	}
+	vols, volsErr := backupvolume.Load(ctx, kbClient, backup, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath, bslCACert)
+
 	if backup.Status.Progress != nil {
 		if backup.Status.Phase == velerov1api.BackupPhaseInProgress {
 			backupStatusInfo["estimatedTotalItemsToBeBackedUp"] = backup.Status.Progress.TotalItems
@@ -226,10 +242,14 @@ func DescribeBackupStatusInSF(ctx context.Context, kbClient kbclient.Client, d *
 	}
 
 	if details {
-		describeBackupResourceListInSF(ctx, kbClient, backupStatusInfo, backup, insecureSkipTLSVerify, caCertPath)
+		describeBackupResourceListInSF(ctx, kbClient, backupStatusInfo, backup, bslCACertErr, bslCACert, insecureSkipTLSVerify, caCertPath)
 	}
 
-	describeBackupVolumesInSF(ctx, kbClient, backup, details, insecureSkipTLSVerify, caCertPath, podVolumeBackups, backupStatusInfo)
+	describeBackupVolumesInSF(ctx, kbClient, backup, details, vols, volsErr, bslCACertErr, bslCACert, insecureSkipTLSVerify, caCertPath, podVolumeBackups, backupStatusInfo)
+
+	if details {
+		describeBackupItemOutcomesInSF(ctx, kbClient, backup, vols, volsErr, bslCACert, insecureSkipTLSVerify, caCertPath, backupStatusInfo)
+	}
 
 	if status.HookStatus != nil {
 		backupStatusInfo["hooksAttempted"] = status.HookStatus.HooksAttempted
@@ -237,13 +257,12 @@ func DescribeBackupStatusInSF(ctx context.Context, kbClient kbclient.Client, d *
 	}
 }
 
-func describeBackupResourceListInSF(ctx context.Context, kbClient kbclient.Client, backupStatusInfo map[string]any, backup *velerov1api.Backup, insecureSkipTLSVerify bool, caCertPath string) {
-	// Get BSL cacert if available
-	bslCACert, err := cacert.GetCACertFromBackup(ctx, kbClient, backup.Namespace, backup)
-	if err != nil {
-		// Log the error but don't fail - we can still try to download without the BSL cacert
-		backupStatusInfo["warningGettingBSLCACert"] = fmt.Sprintf("Warning: Error getting cacert from BSL: %v", err)
-		bslCACert = ""
+func describeBackupResourceListInSF(ctx context.Context, kbClient kbclient.Client, backupStatusInfo map[string]any, backup *velerov1api.Backup, bslCACertErr error, bslCACert string, insecureSkipTLSVerify bool, caCertPath string) {
+	// The cacert is the caller's, so one lookup serves every artifact in this
+	// description. Its failure is reported under this section's key as it always
+	// has been: a consumer may already read warningGettingBSLCACert from here.
+	if bslCACertErr != nil {
+		backupStatusInfo["warningGettingBSLCACert"] = fmt.Sprintf("Warning: Error getting cacert from BSL: %v", bslCACertErr)
 	}
 
 	// In consideration of decoding structured output conveniently, the two separate fields were created here(in func describeBackupResourceList, there is only one field describing either error message or resource list)
@@ -273,24 +292,31 @@ func describeBackupResourceListInSF(ctx context.Context, kbClient kbclient.Clien
 }
 
 func describeBackupVolumesInSF(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup, details bool,
-	insecureSkipTLSVerify bool, caCertPath string, podVolumeBackupCRs []velerov1api.PodVolumeBackup, backupStatusInfo map[string]any) {
+	vols backupvolume.Result, volsErr error, bslCACertErr error, bslCACert string, insecureSkipTLSVerify bool, caCertPath string, podVolumeBackupCRs []velerov1api.PodVolumeBackup, backupStatusInfo map[string]any) {
 	backupVolumes := make(map[string]any)
 
-	// Get BSL cacert if available
-	bslCACert, err := cacert.GetCACertFromBackup(ctx, kbClient, backup.Namespace, backup)
-	if err != nil {
-		// Log the error but don't fail - we can still try to download without the BSL cacert
-		backupVolumes["warningGettingBSLCACert"] = fmt.Sprintf("Warning: Error getting cacert from BSL: %v", err)
-		bslCACert = ""
+	if bslCACertErr != nil {
+		// Not fatal: the artifacts can still be downloaded without the BSL cacert.
+		backupVolumes["warningGettingBSLCACert"] = fmt.Sprintf("Warning: Error getting cacert from BSL: %v", bslCACertErr)
 	}
 
 	nativeSnapshots := []*volume.BackupVolumeInfo{}
 	csiSnapshots := []*volume.BackupVolumeInfo{}
 	legacyInfoSource := false
 
-	buf := new(bytes.Buffer)
-	err = downloadrequest.StreamWithBSLCACert(ctx, kbClient, backup.Namespace, backup.Name, velerov1api.DownloadTargetKindBackupVolumeInfos, buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath, bslCACert)
-	if err == downloadrequest.ErrNotFound {
+	switch {
+	case errors.Is(volsErr, backupvolume.DecodeError):
+		// Kept as its own key: a consumer that retries a fetch failure should not
+		// retry an unreadable artifact, and this key said so before the load moved
+		// into backupvolume.
+		backupVolumes["errorReadBackupVolumeInfo"] = fmt.Sprintf("error reading backup volume info: %v", volsErr)
+
+	case volsErr != nil:
+		backupVolumes["errorGetBackupVolumeInfo"] = fmt.Sprintf("error getting backup volume info: %v", volsErr)
+		return
+
+	case vols.Missing:
+		var err error
 		nativeSnapshots, err = retrieveNativeSnapshotLegacy(ctx, kbClient, backup, insecureSkipTLSVerify, caCertPath, bslCACert)
 		if err != nil {
 			backupVolumes["errorConcludeNativeSnapshot"] = fmt.Sprintf("error concluding native snapshot info: %v", err)
@@ -304,22 +330,14 @@ func describeBackupVolumesInSF(ctx context.Context, kbClient kbclient.Client, ba
 		}
 
 		legacyInfoSource = true
-	} else if err != nil {
-		backupVolumes["errorGetBackupVolumeInfo"] = fmt.Sprintf("error getting backup volume info: %v", err)
-		return
-	} else {
-		var volumeInfos []volume.BackupVolumeInfo
-		if err := json.NewDecoder(buf).Decode(&volumeInfos); err != nil {
-			backupVolumes["errorReadBackupVolumeInfo"] = fmt.Sprintf("error reading backup volume info: %v", err)
-			return
-		}
 
-		for i := range volumeInfos {
-			switch volumeInfos[i].BackupMethod {
+	default:
+		for i := range vols.Volumes {
+			switch vols.Volumes[i].BackupMethod {
 			case volume.NativeSnapshot:
-				nativeSnapshots = append(nativeSnapshots, &volumeInfos[i])
+				nativeSnapshots = append(nativeSnapshots, &vols.Volumes[i])
 			case volume.CSISnapshot:
-				csiSnapshots = append(csiSnapshots, &volumeInfos[i])
+				csiSnapshots = append(csiSnapshots, &vols.Volumes[i])
 			}
 		}
 	}
@@ -581,6 +599,62 @@ func DescribeBackupResultsInSF(ctx context.Context, kbClient kbclient.Client, d 
 	if backup.Status.Errors > 0 {
 		describeResultInSF(errors, resultMap["errors"])
 	}
+}
+
+// describeBackupItemOutcomesInSF adds the per-item outcomes artifact to the
+// structured description, in the shape "velero backup item-outcomes --by-owner
+// -o json" prints.
+//
+// It reports the same rollup rather than the raw rows so that the two
+// machine-readable surfaces agree. A consumer that summed raw rows would count
+// every descendant separately, and would have to know about the volume join and
+// the skip rule in itemoutcome.IsFailure to avoid reporting a benign skip as a
+// lost disk. Rolling up here means the JSON says what the command says.
+//
+// vols is the caller's already-loaded volume info: the join needs it, and
+// loading it again would fetch the same bytes twice for one description. A
+// failure to load degrades the rollup (skips cannot be confirmed benign) rather
+// than dropping the section, and that is stated in the output.
+func describeBackupItemOutcomesInSF(ctx context.Context, kbClient kbclient.Client, backup *velerov1api.Backup,
+	vols backupvolume.Result, volsErr error, bslCACert string, insecureSkipTLSVerify bool, caCertPath string, backupStatusInfo map[string]any) {
+	itemOutcomes := make(map[string]any)
+
+	buf := new(bytes.Buffer)
+	err := downloadrequest.StreamWithBSLCACert(ctx, kbClient, backup.Namespace, backup.Name,
+		velerov1api.DownloadTargetKindBackupItemOutcomes, buf, downloadRequestTimeout, insecureSkipTLSVerify, caCertPath, bslCACert)
+	if err == downloadrequest.ErrNotFound {
+		// The feature is opt-in per backup, so absence is the common case and not
+		// an error. Say it was not collected rather than emitting an empty list,
+		// which a consumer could mistake for a backup that touched nothing.
+		itemOutcomes["errorGettingItemOutcomes"] = "<item outcomes not collected for this backup>"
+		backupStatusInfo["itemOutcomes"] = itemOutcomes
+		return
+	}
+	if err != nil {
+		itemOutcomes["errorGettingItemOutcomes"] = fmt.Sprintf("<error getting item outcomes: %v>", err)
+		backupStatusInfo["itemOutcomes"] = itemOutcomes
+		return
+	}
+
+	var outcomes itemoutcome.ItemOutcomes
+	if err := json.NewDecoder(buf).Decode(&outcomes); err != nil {
+		itemOutcomes["errorGettingItemOutcomes"] = fmt.Sprintf("<error reading item outcomes: %v>", err)
+		backupStatusInfo["itemOutcomes"] = itemOutcomes
+		return
+	}
+
+	var rollupVols []itemoutcome.VolumeRef
+	if volsErr != nil {
+		itemOutcomes["warningGettingVolumeInfo"] = fmt.Sprintf("Warning: Error getting backup volume info: %v; "+
+			"a Skipped row below cannot be confirmed as benign", volsErr)
+	} else {
+		rollupVols = backupvolume.ToRollupRefs(vols.Volumes)
+	}
+
+	itemOutcomes["schemaVersion"] = outcomes.SchemaVersion
+	itemOutcomes["items"] = itemoutcome.Rollup(&outcomes, rollupVols)
+
+	backupStatusInfo["itemOutcomes"] = itemOutcomes
 }
 
 // DescribeResourcePoliciesInSF describes resource policies in structured format.
